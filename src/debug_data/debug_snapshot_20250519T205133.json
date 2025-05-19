@@ -1,0 +1,23 @@
+{
+  "type": "response",
+  "request_seq": 27,
+  "success": true,
+  "command": "stackTrace",
+  "body": {
+    "stackFrames": [
+      {
+        "id": 18,
+        "name": "add_value",
+        "line": 13,
+        "column": 1,
+        "source": {
+          "path": "C:\\Users\\ky0413\\Desktop\\debugpy-1.8.14\\src\\complexclass.py",
+          "sourceReference": 0
+        }
+      }
+    ],
+    "totalFrames": 2
+  },
+  "seq": 76,
+  "pydevd_cmd_id": 502
+}

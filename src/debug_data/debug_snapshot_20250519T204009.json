@@ -1,0 +1,12 @@
+{
+  "type": "response",
+  "request_seq": 16,
+  "success": true,
+  "command": "stackTrace",
+  "body": {
+    "stackFrames": [],
+    "totalFrames": 1
+  },
+  "seq": 44,
+  "pydevd_cmd_id": 502
+}

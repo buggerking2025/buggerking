@@ -1,0 +1,23 @@
+{
+  "type": "response",
+  "request_seq": 882,
+  "success": true,
+  "command": "stackTrace",
+  "body": {
+    "stackFrames": [
+      {
+        "id": 188,
+        "name": "capture_state",
+        "line": 60,
+        "column": 1,
+        "source": {
+          "path": "C:\\Users\\ky0413\\Desktop\\debugpy-1.8.14\\src\\debug_tracer.py",
+          "sourceReference": 0
+        }
+      }
+    ],
+    "totalFrames": 3
+  },
+  "seq": 2398,
+  "pydevd_cmd_id": 502
+}

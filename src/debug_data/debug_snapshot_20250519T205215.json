@@ -1,0 +1,23 @@
+{
+  "type": "response",
+  "request_seq": 940,
+  "success": true,
+  "command": "stackTrace",
+  "body": {
+    "stackFrames": [
+      {
+        "id": 358,
+        "name": "divide",
+        "line": 89,
+        "column": 1,
+        "source": {
+          "path": "C:\\Users\\ky0413\\Desktop\\debugpy-1.8.14\\src\\main.py",
+          "sourceReference": 0
+        }
+      }
+    ],
+    "totalFrames": 2
+  },
+  "seq": 2558,
+  "pydevd_cmd_id": 502
+}

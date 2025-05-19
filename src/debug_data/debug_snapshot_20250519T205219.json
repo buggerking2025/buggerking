@@ -1,0 +1,24 @@
+{
+  "type": "response",
+  "request_seq": 1031,
+  "success": true,
+  "command": "stackTrace",
+  "body": {
+    "stackFrames": [
+      {
+        "id": 2,
+        "name": "<module>",
+        "line": 122,
+        "column": 28,
+        "source": {
+          "path": "C:\\Users\\ky0413\\Desktop\\debugpy-1.8.14\\src\\main.py",
+          "sourceReference": 0
+        },
+        "endColumn": 42
+      }
+    ],
+    "totalFrames": 1
+  },
+  "seq": 2800,
+  "pydevd_cmd_id": 502
+}

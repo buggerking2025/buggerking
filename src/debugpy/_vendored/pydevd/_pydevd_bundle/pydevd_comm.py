@@ -725,7 +725,7 @@ class InternalGetThreadStack(InternalThreadCommand):
                         base_dir = os.path.join("src", "debug_data")
                         os.makedirs(base_dir, exist_ok=True)
 
-                        path = os.path.join(base_dir, f"debug_snapshot_{timestamp}.json")
+                        path = os.path.join(base_dir, f"callstack_snapshot_{timestamp}.json")
                         with open(path, "w", encoding="utf-8") as f:
                             json.dump(json_obj, f, indent=2)
                 except Exception as e:
@@ -851,6 +851,37 @@ def internal_get_variable_json(py_db, request):
             err = "<Internal error - unable to get traceback when getting variables>"
             pydev_log.exception(err)
             variables = []
+
+    # ✅ 변수 정보 JSON으로 저장
+    try:
+        save_dir = "src/debug_data"
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # 저장할 파일 이름 결정: 변수 요청 sequence 사용
+        seq = getattr(request, "seq", datetime.now().strftime("%Y%m%d%H%M%S"))
+        filename = f"{save_dir}/variables_snapshot_{seq}.json"
+
+        # 변수 리스트를 저장 가능한 dict 형태로 변환
+        json_variables = []
+        for var in variables:
+            try:
+                json_variables.append({
+                    "name": var.get("name"),
+                    "value": var.get("value"),
+                    "type": var.get("type"),
+                    "variablesReference": var.get("variablesReference", 0)
+                })
+            except Exception as e:
+                json_variables.append({"name": "<error>", "value": str(e), "type": "<error>", "variablesReference": 0})
+        
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(json_variables, f, indent=2, ensure_ascii=False)
+
+        print(f"[변수 저장] Saved variables to {filename}")
+
+    except Exception as e:
+        print(f"[오류] 변수 저장 실패: {e}")
 
     body = VariablesResponseBody(variables)
     variables_response = pydevd_base_schema.build_response(request, kwargs={"body": body})

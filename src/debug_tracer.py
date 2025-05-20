@@ -153,6 +153,7 @@ def get_debug_summary():
     Returns:
         dict: 요약 정보 또는 None
     """
+    # summary_file 경로: debug_states_dir/debug_summary.json
     summary_file = os.path.join(_state.debug_states_dir, "debug_summary.json")
     
     if os.path.exists(summary_file):

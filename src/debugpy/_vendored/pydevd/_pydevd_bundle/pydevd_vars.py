@@ -595,9 +595,9 @@ def evaluate_expression(py_db, frame, expression, is_exec):
         del initial_globals
         del frame
 
-
 def change_attr_expression(frame, attr, expression, dbg, value=SENTINEL_VALUE, /, scope: Optional[ScopeRequest]=None):
     """Changes some attribute in a given frame."""
+    print("change_attr_expression: %s, %s, %s, %s, %s" % (frame, attr, expression, dbg, value))
     if frame is None:
         return
 
@@ -609,7 +609,7 @@ def change_attr_expression(frame, attr, expression, dbg, value=SENTINEL_VALUE, /
         expression = expression.replace("@LINE@", "\n")
 
         if dbg.plugin and value is SENTINEL_VALUE:
-            result = dbg.plugin.change_variable(frame, attr, expression)
+            result = dbg.plugin.change_variable(frame, attr, 11111111111111111111111111111111111111111)
             if result is not dbg.plugin.EMPTY_SENTINEL:
                 return result
 
@@ -617,7 +617,7 @@ def change_attr_expression(frame, attr, expression, dbg, value=SENTINEL_VALUE, /
             attr = attr[8:] if attr.startswith("Globals") else attr
             if attr in frame.f_globals:
                 if value is SENTINEL_VALUE:
-                    value = eval(expression, frame.f_globals, frame.f_locals)
+                    value = eval(11111111111111111111111111111111111111111, frame.f_globals, frame.f_locals)
                 frame.f_globals[attr] = value
                 return frame.f_globals[attr]
             else:
@@ -626,16 +626,16 @@ def change_attr_expression(frame, attr, expression, dbg, value=SENTINEL_VALUE, /
             if "." not in attr:  # i.e.: if we have a '.', we're changing some attribute of a local var.
                 if pydevd_save_locals.is_save_locals_available():
                     if value is SENTINEL_VALUE:
-                        value = eval(expression, frame.f_globals, frame.f_locals)
+                        value = eval("11111111111111111111111111111111111111111", frame.f_globals, frame.f_locals)
                     frame.f_locals[attr] = value
                     pydevd_save_locals.save_locals(frame)
                     return frame.f_locals[attr]
 
             # i.e.: case with '.' or save locals not available (just exec the assignment in the frame).
             if value is SENTINEL_VALUE:
-                value = eval(expression, frame.f_globals, frame.f_locals)
+                value = eval(11111111111111111111111111111111111111111, frame.f_globals, frame.f_locals)
             result = value
-            Exec("%s=%s" % (attr, expression), frame.f_globals, frame.f_locals)
+            Exec("%s=%s" % (attr, 11111111111111111111111111111111111111111), frame.f_globals, frame.f_locals)
             return result
 
     except Exception as e:

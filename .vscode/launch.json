@@ -69,6 +69,25 @@
       "console": "integratedTerminal",
       "purpose": ["debug-test"],
       "debugAdapterPath": "${workspaceFolder}/src/debugpy/adapter"
+    },
+    {
+      "name": "Infinite Debug Loop",
+      "type": "debugpy",
+      "request": "attach",
+      "listen": {
+        "host": "0.0.0.0",
+        "port": 7789
+      },
+      "justMyCode": false,
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/var/task"
+        }
+      ],
+      "restart": true,
+      "preLaunchTask": "Run Listener and Controller"
+      //"postDebugTask": "Restart Debugging"
     }
   ]
 }

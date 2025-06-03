@@ -4,6 +4,7 @@ import linecache
 import os
 import platform
 import sys
+import socket
 from functools import partial
 
 import pydevd_file_utils
@@ -299,10 +300,10 @@ class PyDevJsonCommandProcessor(object):
         return self.api.list_threads(py_db, request.seq)
 
     def on_terminate_request(self, py_db, request):
-        """
-        :param TerminateRequest request:
-        """
+        """Handle TerminateRequest: terminate debuggee then respond."""
         self._request_terminate_process(py_db)
+        # ★ 추가: listener.py에 shutdown 신호 보내기
+        self._send_shutdown_signal()
         response = pydevd_base_schema.build_response(request)
         return NetCommand(CMD_RETURN, 0, response, is_json=True)
 
@@ -718,15 +719,26 @@ class PyDevJsonCommandProcessor(object):
 
         return hit_condition
 
+    def _send_shutdown_signal(self):
+        """Send shutdown signal to listener.py for all-in-one teardown."""
+        try:
+            with socket.create_connection(("165.194.27.213", 6689), timeout=1) as sock:
+                sock.sendall(json.dumps({"shutdown": True}).encode('utf-8'))
+        except Exception:
+            pass
+
     def on_disconnect_request(self, py_db, request):
         """
-        :param DisconnectRequest request:
+        Handle DisconnectRequest: send shutdown, then disconnect debugpy.
         """
+        # 1) terminate debuggee if requested
         if request.arguments.terminateDebuggee:
             self._request_terminate_process(py_db)
-            response = pydevd_base_schema.build_response(request)
-            return NetCommand(CMD_RETURN, 0, response, is_json=True)
 
+        # 2) send shutdown signal to listener/controller
+        self._send_shutdown_signal()
+
+        # 3) proceed with normal disconnect
         self._launch_or_attach_request_done = False
         py_db.enable_output_redirection(False, False)
         self.api.request_disconnect(py_db, resume_threads=True)

@@ -24,6 +24,21 @@ def lambda_handler(event, context):
         except Exception as e:
             print(f"❗ 전송 실패: {e}")
 
+
+        def calculate(a, b):
+            """두 숫자를 더하는 간단한 함수입니다."""
+            result = a + b
+            return result
+
+        a = 10
+        b = 20  
+
+        debugpy.breakpoint()  # 중단점 설정
+        result = calculate(a, b)
+        debugpy.breakpoint()  # 중단점 설정 후 계산 결과 출력
+        print(f"계산 결과: {result}")
+
+
         for i in range(10):
             print(f"[루프 {i}] 중단점 진입 전")
             debugpy.breakpoint()

@@ -1159,34 +1159,127 @@ def get_callstack_info(py_db, variables_reference):
         }
 
 def should_filter_special_variable(var_name, var_type, var_value):
-    """Special variable 필터링"""
+    """Enhanced Special variable 필터링 - 더 포괄적인 필터링"""
     if not var_name:
         return True
     
-    special_names = {
+    # 1. Special categories that VSCode shows
+    special_categories = {
         "special variables", "class variables", "function variables",
-        "__builtins__", "__cached__", "__loader__", "__spec__"
+        "protected variables", "private variables"
     }
-    if var_name.lower() in special_names:
+    if var_name.lower() in special_categories:
         return True
     
-    important_dunders = {"__name__", "__file__", "__doc__", "__class__"}
-    if var_name.startswith("__") and var_name.endswith("__") and var_name not in important_dunders:
+    # 2. System and built-in variables (확장)
+    system_variables = {
+        "__builtins__", "__cached__", "__loader__", "__spec__", "__package__",
+        "__path__", "__file__", "__annotations__", "__dict__", "__module__",
+        "__qualname__", "__slots__", "__weakref__", "__orig_bases__",
+        "__parameters__", "__origin__", "__args__", "__mro_entries__"
+    }
+    
+    # 중요한 dunder 변수들만 유지
+    important_dunders = {"__name__", "__doc__", "__class__"}
+    
+    if (var_name.startswith("__") and var_name.endswith("__") and 
+        var_name not in important_dunders):
+        if var_name in system_variables:
+            return True
+    
+    # 3. 디버깅 관련 변수들
+    debug_variables = {
+        "__traceback__", "__context__", "__cause__", "__suppress_context__",
+        "__frame__", "__locals__", "__globals__", "__code__"
+    }
+    if var_name in debug_variables:
         return True
     
+    # 4. Built-in 모듈들 (대폭 확장)
     if var_type == "module":
         builtin_modules = {
             "sys", "os", "builtins", "types", "collections", "itertools",
             "functools", "operator", "weakref", "gc", "inspect", "linecache",
-            "threading", "traceback", "warnings", "importlib"
+            "threading", "traceback", "warnings", "importlib", "re", "json",
+            "time", "datetime", "math", "random", "socket", "urllib", "http",
+            "pickle", "copy", "io", "contextlib", "enum", "abc", "typing",
+            "dataclasses", "pathlib", "shutil", "subprocess", "signal",
+            "platform", "locale", "calendar", "decimal", "fractions",
+            "statistics", "zlib", "gzip", "tarfile", "zipfile", "csv",
+            "xml", "html", "email", "base64", "binascii", "hashlib",
+            "hmac", "secrets", "ssl", "asyncio", "concurrent", "multiprocessing",
+            "queue", "sched", "select", "selectors", "sqlite3", "dbm",
+            "unittest", "doctest", "pdb", "profile", "cProfile", "timeit",
+            "trace", "dis", "py_compile", "compileall", "keyword", "token",
+            "tokenize", "ast", "symtable", "code", "codeop", "runpy",
+            "pkgutil", "modulefinder", "imp", "zipimport", "encodings"
         }
-        if any(f"'{mod}'" in var_value for mod in builtin_modules):
+        
+        # 모듈 이름 추출 시도
+        module_name = None
+        if "'" in var_value and "module" in var_value:
+            try:
+                parts = var_value.split("'")
+                if len(parts) >= 2:
+                    module_name = parts[1]
+            except:
+                pass
+        
+        if module_name in builtin_modules:
             return True
     
+    # 5. Private 변수들 (더 엄격하게)
     if var_name.startswith("_") and not var_name.startswith("__"):
-        important_privates = {"_", "_1", "_2", "_3"}
-        if var_name not in important_privates and len(var_name) > 3:
+        important_privates = {"_", "_1", "_2", "_3", "_last_traceback"}
+        if var_name not in important_privates and len(var_name) > 2:
             return True
+    
+    # 6. 타입별 특수 필터링
+    if var_type in ["method", "builtin_function_or_method", "wrapper_descriptor", 
+                    "method_descriptor", "classmethod_descriptor", "staticmethod"]:
+        common_methods = {"__init__", "__str__", "__repr__", "append", "extend", 
+                         "insert", "remove", "pop", "clear", "index", "count",
+                         "get", "keys", "values", "items", "update"}
+        if var_name not in common_methods and var_name.startswith("__"):
+            return True
+    
+    # 7. 큰 컬렉션의 내부 구현
+    if var_type in ["dict_keys", "dict_values", "dict_items", "range", 
+                    "enumerate", "zip", "filter", "map"]:
+        return True
+    
+    return False
+
+def should_filter_by_context(var_name, var_type, var_value, current_depth, parent_type=None):
+    """컨텍스트 기반 필터링 - depth와 부모 타입에 따른 스마트 필터링"""
+    
+    # 1. Depth 기반 필터링
+    if current_depth >= 5:  # 깊이 5 이상에서는 더 엄격하게
+        # 원시 타입이 아닌 것들은 더 제한적으로
+        if var_type not in ["int", "float", "str", "bool", "NoneType"]:
+            # 컬렉션이라면 크기 제한
+            if var_type in ["list", "tuple", "dict", "set"]:
+                if "length" in var_value or len(var_value) > 100:
+                    return True
+            else:
+                return True
+    
+    # 2. 부모 타입에 따른 필터링
+    if parent_type:
+        # 모듈의 자식들은 더 엄격하게
+        if parent_type == "module":
+            if var_name.startswith("_") or var_type in ["function", "type", "module"]:
+                return True
+        
+        # 클래스의 자식들
+        elif parent_type == "type":
+            if var_name.startswith("__") and var_name not in ["__init__", "__str__", "__repr__"]:
+                return True
+    
+    # 3. 순환 참조 가능성이 높은 것들
+    circular_prone = ["__class__", "__dict__", "__module__", "im_class", "im_self"]
+    if var_name in circular_prone:
+        return True
     
     return False
 
@@ -1544,7 +1637,7 @@ def send_file_to_local(file_path, data_type="debug_data"):
 @silence_warnings_decorator
 def internal_get_variable_json(py_db, request):
     """
-    람다용 변수 수집 + 재귀적 자식 변수 탐색 + 로컬 PC로 파일 전송
+    람다용 변수 수집 + 재귀적 자식 변수 탐색 + 통합 파일 저장
     """
     import os
     import json
@@ -1584,23 +1677,19 @@ def internal_get_variable_json(py_db, request):
                 children = variable.get_children_variables(fmt=fmt, scope=scope)
                 print(f"[LAMBDA-DEBUG] Got {len(children)} variables for frame {variables_reference} scope '{scope_type}'")
                 
-                # 변수 처리
-                max_variables = min(20, len(children))
-                for i in range(max_variables):
+                # 변수 처리 (VSCode용은 필터링 없음, JSON용만 필터링)
+                for i in range(len(children)):
                     try:
                         child_var = children[i]
                         var_data = child_var.get_var_data(fmt=fmt)
-                        variables.append(var_data)  # 기존 DAP 응답용
                         
-                        print(f"[LAMBDA-DEBUG] [{scope_type.upper() if scope_type else 'UNKNOWN'}] VAR {i+1}/{len(children)}: {var_data.get('name', 'unknown')}")
+                        # VSCode DAP 응답용: 모든 변수 포함 (필터링 없음)
+                        variables.append(var_data)
                             
                     except Exception as child_processing_error:
                         print(f"[LAMBDA-DEBUG] Error processing frame {variables_reference} {scope_type} child {i+1}: {child_processing_error}")
                 
-                if len(children) > max_variables:
-                    print(f"[LAMBDA-DEBUG] [... {len(children) - max_variables} more {scope_type} variables not processed for frame {variables_reference}]")
-                
-                print(f"[LAMBDA-DEBUG] [{scope_type.upper() if scope_type else 'UNKNOWN'}] Processed {len(variables)} variables")
+                print(f"[LAMBDA-DEBUG] [{scope_type.upper() if scope_type else 'UNKNOWN'}] Collected {len(variables)} variables for VSCode")
                         
             except Exception as children_get_error:
                 print(f"[LAMBDA-DEBUG] Error getting frame {variables_reference} {scope_type} children: {children_get_error}")
@@ -1619,41 +1708,35 @@ def internal_get_variable_json(py_db, request):
             err = "<Internal error - unable to get traceback when getting variables>"
             variables = []
 
-    # 재귀적 자식 변수 탐색 기능 추가
+    # 재귀적 자식 변수 탐색 (JSON 저장용만 필터링 적용)
     variables_with_recursive_children = []
     try:
-        print(f"[LAMBDA-DEBUG] Starting recursive children collection for {len(variables)} variables...")
+        print(f"[LAMBDA-DEBUG] Starting recursive collection for JSON storage (filtering applied)...")
         
         for i, var_data in enumerate(variables):
             try:
-                # 각 변수에 대해 재귀적으로 자식들 수집
-                enhanced_var_data = collect_recursive_children(py_db, var_data, max_depth=3)
+                # JSON 저장용: 필터링 적용하여 재귀 수집
+                var_name = var_data.get("name", "")
+                var_type = var_data.get("type", "")
+                var_value = str(var_data.get("value", ""))
                 
-                # 메타데이터 추가
-                enhanced_var_data.update({
-                    "scope": scope_type,
-                    "frame_id": variables_reference,
-                    "variable_index": i,
-                    "recursive_collection_timestamp": datetime.now().isoformat()
-                })
+                # 최상위 변수도 JSON용으로는 필터링
+                if should_filter_special_variable(var_name, var_type, var_value):
+                    print(f"[JSON-FILTER] Skipped top-level: {var_name} ({var_type})")
+                    continue
+                
+                # 각 변수에 대해 재귀적으로 자식들 수집 (필터링 적용)
+                enhanced_var_data = collect_recursive_children(py_db, var_data)
+                
+                print(f"[LAMBDA-DEBUG] JSON Variable {len(variables_with_recursive_children)+1}: {var_name} (filtered & processed)")
                 
                 variables_with_recursive_children.append(enhanced_var_data)
                 
-                print(f"[LAMBDA-DEBUG] Variable {i+1}/{len(variables)} processed: {var_data.get('name', 'unknown')}")
-                
             except Exception as recursive_error:
-                print(f"[LAMBDA-DEBUG] Error processing variable {i+1}: {recursive_error}")
-                # 에러 발생해도 기본 변수 정보는 유지
-                fallback_var = var_data.copy()
-                fallback_var.update({
-                    "recursive_children": [],
-                    "recursive_error": str(recursive_error),
-                    "scope": scope_type,
-                    "frame_id": variables_reference
-                })
-                variables_with_recursive_children.append(fallback_var)
+                print(f"[LAMBDA-DEBUG] Error processing JSON variable {i+1}: {recursive_error}")
+                # JSON용은 에러 발생해도 스킵
         
-        print(f"[LAMBDA-DEBUG] Completed recursive collection for {len(variables_with_recursive_children)} variables")
+        print(f"[LAMBDA-DEBUG] Completed JSON collection: {len(variables_with_recursive_children)} variables (filtered from {len(variables)} total)")
         
     except Exception as recursive_main_error:
         print(f"[LAMBDA-DEBUG] Main recursive collection error: {recursive_main_error}")
@@ -1680,157 +1763,142 @@ def internal_get_variable_json(py_db, request):
             "code": "# Frame info extraction failed"
         }
 
-    # 람다 전용: /tmp에 JSON 저장 + 로컬 PC로 전송
+    # ✅ frame_id 기반 callstack 관리 (하나의 JSON 파일에 모든 프레임)
     try:
         save_dir = "/tmp"  # 람다 전용
         thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
         
-        # 전체 디버깅 세션에 대한 통합 파일명 (thread_id 기반)
-        session_filename = f"{save_dir}/callstack_variables_{thread_id}.json"
+        # 🔥 thread_id만으로 파일명 생성 (frame_id 제거)
+        session_filename = f"{save_dir}/unified_callstack_variables_{thread_id}.json"
         
-        # 기존 세션 파일이 있으면 읽어서 업데이트, 없으면 새로 생성
+        # 기존 파일이 있으면 읽기, 없으면 새로 생성
         if os.path.exists(session_filename):
             try:
                 with open(session_filename, "r", encoding="utf-8") as f:
                     session_data = json.load(f)
-                print(f"[LAMBDA-DEBUG] Found existing session file, updating frame {variables_reference} {scope_type}")
+                print(f"[LAMBDA-DEBUG] 📁 Loading existing callstack file for frame {variables_reference}")
             except Exception as read_error:
-                print(f"[LAMBDA-DEBUG] Failed to read existing session file: {read_error}")
-                session_data = create_new_session_data(thread_id)
+                print(f"[LAMBDA-DEBUG] Failed to read existing file: {read_error}")
+                session_data = create_empty_session_data(thread_id)
         else:
-            print(f"[LAMBDA-DEBUG] Creating new session file for thread {thread_id}")
-            session_data = create_new_session_data(thread_id)
+            print(f"[LAMBDA-DEBUG] 🆕 Creating new callstack file for thread {thread_id}")
+            session_data = create_empty_session_data(thread_id)
 
-        # 프레임별 데이터 구조 업데이트 (기존 로직 유지 + 재귀 데이터 추가)
-        frame_exists = False
-        for frame_data in session_data["callstacks"]:
-            if frame_data["frame_id"] == variables_reference:
-                # 기존 프레임 발견 - 메타데이터 업데이트
-                print(f"[LAMBDA-DEBUG] Updating existing frame {variables_reference}")
-                
-                frame_data["file"] = frame_info.get("file", "unknown")
-                frame_data["line"] = frame_info.get("line", -1)
-                frame_data["function"] = frame_info.get("function", "unknown")
-                frame_data["code"] = frame_info.get("code", "# Code not available")
-                
-                # 기존 변수 정보 + 재귀적 자식 정보 저장
-                if scope_type == "locals":
-                    frame_data["variables"]["locals"] = variables_with_recursive_children  # 재귀 정보 포함
-                    frame_data["variables"]["locals_basic"] = [
-                        {k: v for k, v in var.items() if k not in ['recursive_children']} 
-                        for var in variables_with_recursive_children
-                    ]  # 기본 정보만 별도 저장
-                elif scope_type == "globals":
-                    frame_data["variables"]["globals"] = variables_with_recursive_children  # 재귀 정보 포함
-                    frame_data["variables"]["globals_basic"] = [
-                        {k: v for k, v in var.items() if k not in ['recursive_children']} 
-                        for var in variables_with_recursive_children
-                    ]  # 기본 정보만 별도 저장
-                else:
-                    # scope_type이 None인 경우 특별 처리
-                    frame_data["variables"]["unknown_scope"] = variables_with_recursive_children
-                    frame_data["variables"]["unknown_scope_basic"] = [
-                        {k: v for k, v in var.items() if k not in ['recursive_children']} 
-                        for var in variables_with_recursive_children
-                    ]
-        
-                # 재귀 통계 추가
-                frame_data["recursive_stats"] = calculate_recursive_stats(variables_with_recursive_children)
-                
-                # 기존 카운트 업데이트
-                frame_data["counts"] = {
-                    "total_locals": len(frame_data["variables"].get("locals", [])),
-                    "total_globals": len(frame_data["variables"].get("globals", [])),
-                    "total_variables": len(frame_data["variables"].get("locals", [])) + len(frame_data["variables"].get("globals", []))
-                }
-                
-                frame_exists = True
-                print(f"[LAMBDA-DEBUG] ✅ Successfully updated frame {variables_reference} with recursive children")
+        # callstacks 배열에서 frame_id로 기존 프레임 찾기
+        target_frame = None
+        for frame in session_data["callstacks"]:
+            if frame["frame_id"] == variables_reference:
+                target_frame = frame
+                print(f"[LAMBDA-DEBUG] 🔄 Found existing frame {variables_reference} at index {session_data['callstacks'].index(frame)}")
                 break
         
-        if not frame_exists:
-            # 새 프레임 추가 (재귀 정보 포함)
-            new_frame = {
+        # 프레임이 없으면 새로 생성
+        if target_frame is None:
+            target_frame = {
                 "frame_id": variables_reference,
                 "file": frame_info.get("file", "unknown"),
                 "line": frame_info.get("line", -1),
                 "function": frame_info.get("function", "unknown"),
                 "code": frame_info.get("code", "# Code not available"),
                 "variables": {
-                    "locals": variables_with_recursive_children if scope_type == "locals" else [],
-                    "globals": variables_with_recursive_children if scope_type == "globals" else [],
-                    "locals_basic": [
-                        {k: v for k, v in var.items() if k not in ['recursive_children']} 
-                        for var in (variables_with_recursive_children if scope_type == "locals" else [])
-                    ],
-                    "globals_basic": [
-                        {k: v for k, v in var.items() if k not in ['recursive_children']} 
-                        for var in (variables_with_recursive_children if scope_type == "globals" else [])
-                    ]
+                    "locals": [],
+                    "globals": []
                 },
                 "counts": {
-                    "total_locals": len(variables_with_recursive_children) if scope_type == "locals" else 0,
-                    "total_globals": len(variables_with_recursive_children) if scope_type == "globals" else 0,
-                    "total_variables": len(variables_with_recursive_children)
+                    "total_locals": 0,
+                    "total_globals": 0,
+                    "total_variables": 0
                 },
-                "recursive_stats": calculate_recursive_stats(variables_with_recursive_children),
-                "extraction_method": "lambda_debugger_with_recursive_children"
+                "recursive_stats": {}
             }
-            
-            # scope_type이 None인 경우 특별 처리
-            if scope_type is None:
-                new_frame["variables"]["unknown_scope"] = variables_with_recursive_children
-                new_frame["variables"]["unknown_scope_basic"] = [
-                    {k: v for k, v in var.items() if k not in ['recursive_children']} 
-                    for var in variables_with_recursive_children
-                ]
-            
-            session_data["callstacks"].append(new_frame)
-            print(f"[LAMBDA-DEBUG] Added new frame {variables_reference} with recursive children")
-
-        # 전체 요약 업데이트
+            session_data["callstacks"].append(target_frame)
+            print(f"[LAMBDA-DEBUG] ➕ Added new frame {variables_reference} at index {len(session_data['callstacks'])-1}")
+        
+        # scope_type에 따라 데이터 추가/업데이트
+        if scope_type == "locals":
+            target_frame["variables"]["locals"] = variables_with_recursive_children
+            print(f"[LAMBDA-DEBUG] 📥 Added LOCALS to frame {variables_reference}: {len(variables_with_recursive_children)} variables")
+        elif scope_type == "globals":
+            target_frame["variables"]["globals"] = variables_with_recursive_children
+            print(f"[LAMBDA-DEBUG] 📥 Added GLOBALS to frame {variables_reference}: {len(variables_with_recursive_children)} variables")
+        else:
+            target_frame["variables"]["unknown_scope"] = variables_with_recursive_children
+            print(f"[LAMBDA-DEBUG] 📥 Added UNKNOWN_SCOPE to frame {variables_reference}: {len(variables_with_recursive_children)} variables")
+        
+        # 프레임 메타데이터 최신화
+        target_frame["file"] = frame_info.get("file", "unknown")
+        target_frame["line"] = frame_info.get("line", -1)
+        target_frame["function"] = frame_info.get("function", "unknown")
+        target_frame["code"] = frame_info.get("code", "# Code not available")
+        
+        # 카운트 및 통계 재계산
+        target_frame["counts"] = {
+            "total_locals": len(target_frame["variables"]["locals"]),
+            "total_globals": len(target_frame["variables"]["globals"]),
+            "total_variables": len(target_frame["variables"]["locals"]) + len(target_frame["variables"]["globals"])
+        }
+        
+        target_frame["recursive_stats"][scope_type or "unknown"] = calculate_recursive_stats(variables_with_recursive_children)
+        
+        # 전체 세션 메타데이터 업데이트
         total_frames = len(session_data["callstacks"])
         total_variables = sum(frame["counts"]["total_variables"] for frame in session_data["callstacks"])
+        frames_with_both_scopes = len([f for f in session_data["callstacks"] 
+                                     if len(f["variables"]["locals"]) > 0 and len(f["variables"]["globals"]) > 0])
         
-        session_data["total_callstack_levels"] = total_frames
+        session_data["last_updated"] = datetime.now().isoformat()
+        session_data["last_updated_scope"] = scope_type
+        session_data["last_updated_frame"] = variables_reference
         session_data["summary"] = {
             "total_frames": total_frames,
             "total_variables": total_variables,
-            "frames_with_locals": len([f for f in session_data["callstacks"] if f["variables"]["locals"]]),
-            "frames_with_globals": len([f for f in session_data["callstacks"] if f["variables"]["globals"]])
+            "frames_with_both_scopes": frames_with_both_scopes,
+            "callstack_complete": frames_with_both_scopes > 0  # 적어도 하나의 프레임에 locals+globals가 있으면
         }
-        session_data["last_updated"] = datetime.now().isoformat()
-        session_data["last_updated_frame"] = variables_reference
-        session_data["last_updated_scope"] = scope_type
-        session_data["extraction_method"] = "lambda_debugger_enhanced_with_recursive_children"
         
-        # 파일 저장
+        # 파일 덮어쓰기 저장
         with open(session_filename, "w", encoding="utf-8") as f:
             json.dump(session_data, f, indent=2, ensure_ascii=False)
 
-        print(f"[LAMBDA-DEBUG] File saved to {session_filename}")
-        print(f"[LAMBDA-DEBUG] Total frames: {total_frames}, Total variables: {total_variables}")
+        print(f"[LAMBDA-DEBUG] 💾 Callstack file updated: {session_filename}")
+        print(f"[LAMBDA-DEBUG] 📊 Current callstack state:")
+        for i, frame in enumerate(session_data["callstacks"]):
+            locals_count = len(frame["variables"]["locals"])
+            globals_count = len(frame["variables"]["globals"])
+            complete = "✅" if locals_count > 0 and globals_count > 0 else "❌"
+            file_info = f"{frame['file']}:{frame['line']}"
+            code_preview = frame['code'][:50] + "..." if len(frame['code']) > 50 else frame['code']
+            print(f"  [{i}] Frame {frame['frame_id']}: {frame['function']} | {file_info}")
+            print(f"      Code: {code_preview}")
+            print(f"      Variables: L:{locals_count} G:{globals_count} {complete}")
+            print()  # 빈 줄로 구분
 
-        # 람다 전용: 항상 파일 전송
-        print(f"[LAMBDA-DEBUG] 🚀 파일 전송 시작...")
-        success = send_file_to_local(session_filename, "debug_data")
-        if success:
-            print(f"[LAMBDA-DEBUG] ✅ 파일 전송 성공!")
-            # 전송 완료 후 임시 파일 삭제
-            try:
-                os.remove(session_filename)
-                print(f"[LAMBDA-DEBUG] 🗑️ 임시 파일 삭제 완료")
-            except:
-                pass
+        # 🚀 현재 프레임이 완전해졌을 때 전송
+        current_frame_complete = (len(target_frame["variables"]["locals"]) > 0 and 
+                                len(target_frame["variables"]["globals"]) > 0)
+        
+        if scope_type == "globals" and current_frame_complete:
+            print(f"[LAMBDA-DEBUG] 🚀 Frame {variables_reference} complete! Sending callstack file...")
+            success = send_file_to_local(session_filename, "unified_callstack_data")
+            if success:
+                print(f"[LAMBDA-DEBUG] ✅ Callstack file sent successfully!")
+                # 전송 후에는 파일 유지 (다른 프레임이 추가될 수 있음)
+            else:
+                print(f"[LAMBDA-DEBUG] ❌ Callstack file send failed!")
         else:
-            print(f"[LAMBDA-DEBUG] ❌ 파일 전송 실패!")
+            print(f"[LAMBDA-DEBUG] ⏳ Frame {variables_reference} waiting for complete data... (current: {scope_type})")
 
     except Exception as e:
-        print(f"[LAMBDA-DEBUG] Failed to save/transfer session: {e}")
+        print(f"[LAMBDA-DEBUG] Failed to save/transfer callstack session: {e}")
         import traceback
         print(f"[LAMBDA-DEBUG] Traceback: {traceback.format_exc()}")
 
-    print(f"[LAMBDA-DEBUG] Session completed for frame {variables_reference} {scope_type}")
+    except Exception as e:
+        print(f"[LAMBDA-DEBUG] Failed to save/transfer unified session: {e}")
+        import traceback
+        print(f"[LAMBDA-DEBUG] Traceback: {traceback.format_exc()}")
+
+    print(f"[LAMBDA-DEBUG] Callstack session completed for frame {variables_reference} {scope_type}")
 
     # DAP 응답 생성 (완전히 동일하게 유지)
     from _pydevd_bundle._debug_adapter.pydevd_schema import VariablesResponseBody
@@ -1842,27 +1910,25 @@ def internal_get_variable_json(py_db, request):
     variables_response = pydevd_base_schema.build_response(request, kwargs={"body": body})
     py_db.writer.add_command(NetCommand(CMD_RETURN, 0, variables_response, is_json=True))
 
-def create_new_session_data(thread_id):
-    """새로운 디버깅 세션 데이터 구조 생성"""
+def create_empty_session_data(thread_id):
+    """빈 callstack 세션 데이터 구조 생성"""
     return {
         "timestamp": datetime.now().isoformat(),
         "thread_id": thread_id,
-        "extraction_method": "lambda_debugger_with_recursive_children",
-        "callstacks": [],
-        "total_callstack_levels": 0,
+        "extraction_method": "lambda_debugger_callstack_array",
+        "callstacks": [],  # 빈 배열로 시작, frame_id별로 추가됨
         "summary": {
             "total_frames": 0,
             "total_variables": 0,
-            "frames_with_locals": 0,
-            "frames_with_globals": 0,
-            "frames_with_unknown_scope": 0
+            "frames_with_both_scopes": 0,
+            "callstack_complete": False
         },
         "debug_info": {
             "session_created": datetime.now().isoformat(),
-            "issues_encountered": []
+            "callstack_mode": True,
+            "note": "Each index in callstacks array represents depth (0=bottom/current)"
         }
     }
-
 
 def extract_frame_info_improved(py_db, thread_id, variables_reference):
     """프레임 정보 추출 (람다 환경 최적화)"""
@@ -1955,9 +2021,9 @@ def extract_frame_info_improved(py_db, thread_id, variables_reference):
             "code": f"# Critical error: {str(e)}"
         }
 
-def collect_recursive_children(py_db, var_data, max_depth=3, current_depth=0, processed_refs=None):
+def collect_recursive_children(py_db, var_data, current_depth=0, processed_refs=None, parent_type=None):
     """
-    변수의 자식들을 재귀적으로 수집하여 JSON 구조로 반환
+    제한을 제거하고 스마트 필터링을 적용한 재귀적 자식 수집
     """
     if processed_refs is None:
         processed_refs = set()
@@ -1969,14 +2035,19 @@ def collect_recursive_children(py_db, var_data, max_depth=3, current_depth=0, pr
     enhanced_var["recursive_collection_time"] = datetime.now().isoformat()
     
     variables_reference = var_data.get("variablesReference", 0)
+    var_name = var_data.get("name", "")
+    var_type = var_data.get("type", "")
+    var_value = str(var_data.get("value", ""))
     
-    # 재귀 종료 조건
-    if (current_depth >= max_depth or 
+    # 재귀 종료 조건 (제한 완화)
+    max_reasonable_depth = 10  # 기존 3에서 10으로 증가
+    
+    if (current_depth >= max_reasonable_depth or 
         variables_reference == 0 or 
         variables_reference in processed_refs):
         
-        if current_depth >= max_depth:
-            enhanced_var["recursive_truncated"] = "max_depth_reached"
+        if current_depth >= max_reasonable_depth:
+            enhanced_var["recursive_truncated"] = f"max_depth_reached_{max_reasonable_depth}"
         elif variables_reference == 0:
             enhanced_var["recursive_truncated"] = "no_children"
         elif variables_reference in processed_refs:
@@ -1996,18 +2067,41 @@ def collect_recursive_children(py_db, var_data, max_depth=3, current_depth=0, pr
             variable = frames_tracker.get_variable(variables_reference)
             children = variable.get_children_variables()
             
-            # 성능을 위해 자식 개수 제한
-            max_children = min(20, len(children))
+            print(f"[FILTER-DEBUG] Depth {current_depth}: {var_name} ({var_type}) has {len(children)} children")
             
-            for i in range(max_children):
+            # 필터링된 자식들만 처리
+            filtered_children = []
+            for i, child_var in enumerate(children):
                 try:
-                    child_var = children[i]
+                    child_data = child_var.get_var_data()
+                    child_name = child_data.get("name", "")
+                    child_type = child_data.get("type", "")
+                    child_value = str(child_data.get("value", ""))
+                    
+                    # 기본 필터링
+                    if should_filter_special_variable(child_name, child_type, child_value):
+                        continue
+                    
+                    # 컨텍스트 기반 필터링
+                    if should_filter_by_context(child_name, child_type, child_value, current_depth, var_type):
+                        continue
+                    
+                    filtered_children.append(child_var)
+                    
+                except Exception as child_error:
+                    print(f"[FILTER-ERROR] Error checking child {i}: {child_error}")
+                    continue
+            
+            print(f"[FILTER-DEBUG] Filtered {len(children)} -> {len(filtered_children)} children for {var_name}")
+            
+            # 필터링된 자식들을 재귀적으로 처리
+            for i, child_var in enumerate(filtered_children):
+                try:
                     child_data = child_var.get_var_data()
                     
-                    # 🔥 재귀 호출로 자식의 자식들도 수집
+                    # 🔥 재귀 호출 (올바른 매개변수 순서)
                     recursive_child = collect_recursive_children(
-                        py_db, child_data, max_depth, current_depth + 1, 
-                        processed_refs.copy()  # 각 브랜치마다 독립적
+                        py_db, child_data, current_depth + 1, processed_refs.copy(), var_type
                     )
                     
                     enhanced_var["recursive_children"].append(recursive_child)
@@ -2026,21 +2120,11 @@ def collect_recursive_children(py_db, var_data, max_depth=3, current_depth=0, pr
             
             # 자식 통계 추가
             enhanced_var["recursive_stats"] = {
-                "total_children": len(children),
+                "original_children": len(children),
+                "filtered_children": len(filtered_children),
                 "displayed_children": len(enhanced_var["recursive_children"]),
-                "children_truncated": len(children) > max_children
+                "filter_ratio": f"{len(filtered_children)}/{len(children)}" if len(children) > 0 else "0/0"
             }
-            
-            if len(children) > max_children:
-                truncated_info = {
-                    "name": f"<...{len(children) - max_children}_more_children>",
-                    "value": f"총 {len(children)}개 중 {max_children}개만 표시",
-                    "type": "<info>",
-                    "variablesReference": 0,
-                    "recursive_children": [],
-                    "recursive_depth": current_depth + 1
-                }
-                enhanced_var["recursive_children"].append(truncated_info)
                 
     except Exception as e:
         enhanced_var["recursive_error"] = str(e)

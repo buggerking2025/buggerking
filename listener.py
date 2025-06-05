@@ -137,7 +137,7 @@
 
 # if __name__ == "__main__":
 #     main()
-# listener.py 수정된 버전 - 파일 수신 기능 추가
+# listener.py 수정된 버전 - 파일 저장 기능 추가
 import socket
 import json
 import threading
@@ -151,6 +151,9 @@ PORT = 6689
 SHUTDOWN_CODE = 123
 sock = None
 shutdown_flag = threading.Event()  # 스레드 간 shutdown 신호 공유
+
+# 디버그 데이터 저장 폴더 설정
+DEBUG_DATA_DIR = "debug_data"
 
 # Ctrl+C 핸들러: 수동 종료
 def handle_sigint(signum, frame):
@@ -168,6 +171,50 @@ def handle_sigint(signum, frame):
     os._exit(exit_code)
 
 signal.signal(signal.SIGINT, handle_sigint)
+
+# 디버그 데이터 저장 함수
+def save_debug_data(data_type, filename, content, file_size):
+    """Lambda에서 전송된 디버그 데이터를 파일로 저장"""
+    try:
+        # 디버그 데이터 폴더 생성
+        if not os.path.exists(DEBUG_DATA_DIR):
+            os.makedirs(DEBUG_DATA_DIR)
+            print(f"[📁] 생성됨: {DEBUG_DATA_DIR}")
+        
+        # 타임스탬프 추가한 파일명 생성
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 파일명 처리 (확장자 유지)
+        if '.' in filename:
+            name, ext = filename.rsplit('.', 1)
+            safe_filename = f"{timestamp}_{name}.{ext}"
+        else:
+            safe_filename = f"{timestamp}_{filename}.json"
+        
+        file_path = os.path.join(DEBUG_DATA_DIR, safe_filename)
+        
+        # 파일 저장
+        with open(file_path, 'w', encoding='utf-8') as f:
+            if isinstance(content, str):
+                f.write(content)
+            else:
+                json.dump(content, f, indent=2, ensure_ascii=False)
+        
+        actual_size = os.path.getsize(file_path)
+        
+        print(f"[💾] 파일 저장 완료!")
+        print(f"    📂 경로: {file_path}")
+        print(f"    📊 타입: {data_type}")
+        print(f"    📏 크기: {actual_size} bytes (전송: {file_size} bytes)")
+        print(f"    📅 시간: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"[❌] 파일 저장 실패: {e}")
+        import traceback
+        print(f"[❌] 상세 오류: {traceback.format_exc()}")
+        return False
 
 # 남은 시간 출력 루프
 def print_remaining_time(initial_ms):
@@ -191,171 +238,98 @@ def print_remaining_time(initial_ms):
             os.execv(sys.executable, [sys.executable] + sys.argv)
         time.sleep(0.5)
 
-def receive_large_data(conn, timeout=30):
-    """큰 데이터를 안전하게 수신하는 함수"""
-    conn.settimeout(timeout)
-    data_parts = []
-    total_size = 0
-    start_time = time.time()
-    
+# Lambda에서 보내는 대용량 데이터 수신 함수
+def receive_large_data(conn, expected_size=None):
+    """큰 데이터를 청크 단위로 안전하게 수신"""
     try:
+        all_data = b""
+        
         while True:
-            # shutdown 플래그 확인
-            if shutdown_flag.is_set():
-                print("[🔚] Shutdown으로 데이터 수신 중단")
-                return b""
-                
-            # 타임아웃 체크
-            if time.time() - start_time > timeout:
-                print(f"[⚠️] 데이터 수신 타임아웃 ({timeout}초)")
+            chunk = conn.recv(8192)  # 8KB씩 수신
+            if not chunk:
                 break
+            all_data += chunk
             
+            # 예상 크기가 있으면 체크
+            if expected_size and len(all_data) >= expected_size:
+                break
+                
+            # JSON 종료 확인 (간단한 방법)
             try:
-                chunk = conn.recv(8192)  # 8KB 청크
-                if not chunk:
-                    break  # 연결 종료
-                    
-                data_parts.append(chunk)
-                total_size += len(chunk)
-                
-                # 너무 큰 데이터 방지 (10MB 제한)
-                if total_size > 10 * 1024 * 1024:
-                    print(f"[⚠️] 데이터 크기 초과 ({total_size} bytes) - 수신 중단")
-                    break
-                    
-                # JSON 완료 확인 (간단한 휴리스틱)
-                combined_data = b"".join(data_parts)
-                try:
-                    # JSON이 완성되었는지 확인
-                    json.loads(combined_data.decode('utf-8'))
-                    print(f"[✅] 완전한 JSON 데이터 수신 완료 ({total_size} bytes)")
-                    return combined_data
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    # 아직 완성되지 않음, 계속 수신
-                    continue
-                    
-            except socket.timeout:
-                # 일시적 타임아웃, 계속 시도
-                continue
-            except socket.error as e:
-                print(f"[❗] 소켓 에러: {e}")
-                break
-                
-    except Exception as e:
-        print(f"[❗] 데이터 수신 중 오류: {e}")
-    
-    # 부분 데이터라도 반환
-    return b"".join(data_parts)
-
-def save_received_file(payload):
-    """수신한 파일 데이터를 로컬에 저장"""
-    try:
-        filename = payload.get('filename', f'debug_data_{int(time.time())}.json')
-        content = payload.get('content', '')
-        file_size = payload.get('file_size', len(content))
-        timestamp = payload.get('timestamp', datetime.datetime.now().isoformat())
-        source = payload.get('source', 'unknown')
+                json.loads(all_data.decode('utf-8'))
+                break  # 완전한 JSON이면 종료
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue  # 아직 불완전하면 계속 수신
         
-        # 로컬 저장 경로 확인 및 생성
-        local_save_dir = "src/debug_data"
-        if not os.path.exists(local_save_dir):
-            os.makedirs(local_save_dir, exist_ok=True)
-            print(f"[📁] 디렉토리 생성: {local_save_dir}")
-        
-        # 파일명 중복 처리
-        base_name, ext = os.path.splitext(filename)
-        file_path = os.path.join(local_save_dir, filename)
-        counter = 1
-        
-        while os.path.exists(file_path):
-            new_filename = f"{base_name}_{counter}{ext}"
-            file_path = os.path.join(local_save_dir, new_filename)
-            counter += 1
-        
-        # 파일 저장
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        
-        # 저장 결과 출력
-        actual_size = os.path.getsize(file_path)
-        print(f"[📁] 파일 저장 완료!")
-        print(f"    📄 파일명: {os.path.basename(file_path)}")
-        print(f"    📏 크기: {actual_size:,} bytes (예상: {file_size:,})")
-        print(f"    📂 경로: {file_path}")
-        print(f"    🕐 시간: {timestamp}")
-        print(f"    🌩️ 출처: {source}")
-        
-        # 파일 내용 간단 검증
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                test_data = json.load(f)
-            
-            if isinstance(test_data, dict):
-                callstacks_count = len(test_data.get('callstacks', []))
-                total_variables = test_data.get('summary', {}).get('total_variables', 0)
-                print(f"    📊 콜스택 프레임: {callstacks_count}개")
-                print(f"    🔢 총 변수: {total_variables}개")
-        except Exception as validation_error:
-            print(f"    ⚠️ 파일 검증 실패: {validation_error}")
-        
-        return True
+        return all_data
         
     except Exception as e:
-        print(f"[❗] 파일 저장 실패: {e}")
-        return False
+        print(f"[❗] 대용량 데이터 수신 오류: {e}")
+        return b""
 
-# Lambda에서 보내는 연결(타이머 / shutdown / 파일) 처리
+# Lambda에서 보내는 연결(타이머 / shutdown / 파일 저장) 처리
 def handle_connection(conn, addr):
     global sock
     try:
-        print(f"[🔗] 연결 수락: {addr}")
+        print(f"[🔗] 연결됨: {addr}")
         
-        # 큰 데이터 수신 지원
-        raw_data = receive_large_data(conn, timeout=30)
+        # 첫 번째 청크 수신
+        initial_data = conn.recv(1024)
         
-        if not raw_data:
-            print(f"[⚠️] {addr}에서 빈 데이터 수신")
+        if not initial_data:
+            print(f"[❗] 빈 데이터 수신 from {addr}")
             return
         
-        # JSON 파싱 시도
+        # JSON 파싱 시도 (작은 데이터인지 확인)
         try:
-            payload = json.loads(raw_data.decode('utf-8'))
-            print(f"[📨] JSON 파싱 성공 from {addr} ({len(raw_data):,} bytes)")
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            print(f"[❗] JSON 파싱 실패 from {addr}: {e}")
-            # 원시 데이터 일부 출력 (디버깅용)
-            preview = raw_data[:200].decode('utf-8', errors='ignore')
-            print(f"[👁️] 데이터 미리보기: {preview}...")
-            return
-        
-        # 🚨 shutdown 신호 처리
+            payload = json.loads(initial_data.decode('utf-8'))
+            
+            # 완전한 JSON을 받았으면 처리
+            handle_payload(payload, addr, initial_data)
+            
+        except json.JSONDecodeError:
+            # 불완전한 JSON이면 나머지 데이터 수신
+            print(f"[📦] 대용량 데이터 감지 - 추가 수신 중...")
+            
+            remaining_data = receive_large_data(conn)
+            full_data = initial_data + remaining_data
+            
+            try:
+                payload = json.loads(full_data.decode('utf-8'))
+                handle_payload(payload, addr, full_data)
+                
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                print(f"[❗] JSON 파싱 실패 from {addr}: {e}")
+                print(f"[📏] 수신 데이터 크기: {len(full_data)} bytes")
+                
+    except Exception as e:
+        print(f"[❗] 연결 처리 오류 from {addr}: {e}")
+        import traceback
+        print(f"[❗] 상세 오류: {traceback.format_exc()}")
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+def handle_payload(payload, addr, raw_data):
+    """페이로드 타입별 처리"""
+    try:
+        # 1. Shutdown 신호 처리
         if payload.get('shutdown'):
             print(f"[🚨] Shutdown signal 수신 from {addr}")
             shutdown_flag.set()  # 플래그 설정
             
             # 메인 스레드가 정리할 수 있도록 잠시 대기
             time.sleep(0.1)
+            
             print(f"[🔚] Shutdown 처리 완료 - 메인 스레드로 제어 이관")
             return
         
-        # 📁 debug_data 파일 처리 (새로 추가)
-        elif payload.get('data_type') == 'debug_data':
-            print(f"[📁] Debug 파일 데이터 수신 from {addr}")
-            success = save_received_file(payload)
-            if success:
-                print(f"[✅] Debug 파일 저장 성공!")
-            else:
-                print(f"[❌] Debug 파일 저장 실패!")
-            return
-        
-        # ⏰ timeout 신호 처리 (기존)
-        elif 'remaining_ms' in payload:
+        # 2. Timeout 신호 처리
+        if 'remaining_ms' in payload and 'data_type' not in payload:
             remaining_ms = int(payload.get('remaining_ms', 0))
-            session_info = payload.get('debug_session', 'unknown')
-            print(f"[📨] Timeout 신호 수신 from {addr}")
-            print(f"    ⏰ 남은 시간: {remaining_ms} ms")
-            print(f"    🏷️ 세션: {session_info}")
-            
+            print(f"[📨] Timeout 신호 수신 from {addr} | timeout: {remaining_ms} ms")
             threading.Thread(
                 target=print_remaining_time,
                 args=(remaining_ms,),
@@ -363,47 +337,62 @@ def handle_connection(conn, addr):
             ).start()
             return
         
-        # 🤷 기타 데이터 처리
-        else:
-            print(f"[❓] 알 수 없는 데이터 타입 from {addr}")
-            print(f"    🔑 키들: {list(payload.keys())}")
-            # 진단용 정보 출력
-            for key, value in payload.items():
-                if isinstance(value, str) and len(value) > 100:
-                    print(f"    {key}: {value[:100]}... ({len(value)} chars)")
-                else:
-                    print(f"    {key}: {value}")
-            return
+        # 3. 파일 저장 처리
+        data_type = payload.get('data_type')
+        if data_type:
+            filename = payload.get('filename', f'debug_data_{int(time.time())}.json')
+            content = payload.get('content', '')
+            file_size = payload.get('file_size', len(raw_data))
             
+            print(f"[📥] 파일 데이터 수신 from {addr}")
+            print(f"    📄 파일명: {filename}")
+            print(f"    🏷️ 타입: {data_type}")
+            print(f"    📏 크기: {file_size} bytes")
+            
+            # 파일 저장
+            success = save_debug_data(data_type, filename, content, file_size)
+            
+            if success:
+                print(f"[✅] 파일 저장 성공: {filename}")
+            else:
+                print(f"[❌] 파일 저장 실패: {filename}")
+            
+            return
+        
+        # 4. 기타 데이터 처리
+        print(f"[❓] 알 수 없는 데이터 타입 from {addr}")
+        print(f"[📋] 페이로드 키: {list(payload.keys())}")
+        
+        # 일반적인 디버그 데이터로 저장 시도
+        if len(payload) > 1:  # 단순 신호가 아니면
+            filename = f"unknown_data_{int(time.time())}.json"
+            save_debug_data("unknown", filename, payload, len(raw_data))
+        
     except Exception as e:
-        print(f"[❗] 연결 처리 오류 from {addr}: {e}")
+        print(f"[❗] 페이로드 처리 오류: {e}")
         import traceback
-        print(f"[🔍] 상세 오류: {traceback.format_exc()}")
-    finally:
-        try:
-            conn.close()
-            print(f"[🔌] 연결 종료: {addr}")
-        except:
-            pass
+        print(f"[❗] 상세 오류: {traceback.format_exc()}")
 
 def main():
     global sock
+    
+    print(f"""
+🚀 Enhanced Listener 시작
+📅 시간: {datetime.datetime.now()}
+📂 저장 폴더: {DEBUG_DATA_DIR}
+🌐 리스닝 포트: {PORT}
+""")
+    
     # 문제 매처를 위해 반드시 이 두 줄을 찍습니다.
     print("listener.py:1:1: 디버깅 대기 중")
     print("디버깅 준비 완료")
 
-    # 타이머 + 파일 수신용 TCP 서버
+    # 타이머 수신용 TCP 서버
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", PORT))
-    sock.listen(5)  # 백로그 증가
+    sock.listen(5)  # 큐 크기 증가
     sock.settimeout(1.0)
-    
-    print(f"listener.py 시작: {datetime.datetime.now()}")
-    print(f"[🌐] 포트 {PORT}에서 다음을 수신 대기:")
-    print(f"    ⏰ 타임아웃 신호 (remaining_ms)")
-    print(f"    🚨 종료 신호 (shutdown)")
-    print(f"    📁 Debug 파일 (debug_data)")
 
     try:
         while True:
@@ -414,6 +403,7 @@ def main():
                 
             try:
                 conn, addr = sock.accept()
+                print(f"[🔗] 새 연결: {addr}")
             except socket.timeout:
                 continue
             except OSError:
@@ -433,7 +423,7 @@ def main():
             ).start()
             
     except KeyboardInterrupt:
-        pass
+        print("\n[⚠️] Ctrl+C로 인한 종료")
     finally:
         if sock:
             sock.close()

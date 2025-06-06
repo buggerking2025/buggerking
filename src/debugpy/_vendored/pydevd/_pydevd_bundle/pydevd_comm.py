@@ -2354,10 +2354,20 @@ def internal_change_variable_json(py_db, request):
     # : :type arguments: SetVariableArguments
     arguments = request.arguments
     variables_reference = arguments.variablesReference
+    variable_name = arguments.name
+    new_value = arguments.value
+    
+    print(f"[CHANGE-DEBUG] 🔧 변수 변경 요청:")
+    print(f"[CHANGE-DEBUG]   name: '{variable_name}'")
+    print(f"[CHANGE-DEBUG]   value: '{new_value}'")
+    print(f"[CHANGE-DEBUG]   variables_reference: {variables_reference}")
+    
     scope = None
+    original_variables_reference = variables_reference
     if isinstance_checked(variables_reference, ScopeRequest):
         scope = variables_reference
         variables_reference = variables_reference.variable_reference
+        print(f"[CHANGE-DEBUG]   scope: {scope.scope if scope else None}")
 
     fmt = arguments.format
     if hasattr(fmt, "to_dict"):
@@ -2365,39 +2375,401 @@ def internal_change_variable_json(py_db, request):
 
     try:
         variable = py_db.suspended_frames_manager.get_variable(variables_reference)
+        print(f"[CHANGE-DEBUG] ✅ Variable container found: {type(variable).__name__}")
     except KeyError:
         variable = None
+        print(f"[CHANGE-DEBUG] ❌ Variable container not found: KeyError")
 
     if variable is None:
+        print(f"[CHANGE-DEBUG] ❌ Writing error response: variable container not found")
         _write_variable_response(
-            py_db, request, value="", success=False, message="Unable to find variable container to change: %s." % (variables_reference,)
+            py_db, request, value="", success=False, 
+            message="Unable to find variable container to change: %s." % (variables_reference,)
         )
         return
 
-    child_var = variable.change_variable(arguments.name, arguments.value, py_db, fmt=fmt, scope=scope)
+    # 🔍 변경 전 현재 값 확인
+    try:
+        current_var_data = variable.get_var_data(fmt=fmt)
+        current_value = current_var_data.get("value", "N/A")
+        print(f"[CHANGE-DEBUG] 📊 Current value before change: '{current_value}'")
+    except Exception as e:
+        print(f"[CHANGE-DEBUG] ⚠️ Could not get current value: {e}")
+        current_value = "unknown"
 
-    if child_var is None:
-        _write_variable_response(py_db, request, value="", success=False, message="Unable to change: %s." % (arguments.name,))
+    print(f"[CHANGE-DEBUG] 🔄 Attempting to change variable...")
+    
+    # 🚀 핵심 개선: 다단계 변수 변경 시도
+    child_var = None
+    success = False
+    final_var_data = None
+    
+    # 방법 1: 기존 change_variable 시도
+    try:
+        child_var = variable.change_variable(variable_name, new_value, py_db, fmt=fmt, scope=scope)
+        
+        if child_var is not None:
+            # 변경 후 값 즉시 확인
+            test_data = child_var.get_var_data(fmt=fmt)
+            actual_new_value = test_data.get("value", "")
+            
+            print(f"[CHANGE-DEBUG] 📊 Value after change_variable: '{actual_new_value}'")
+            
+            # 🔍 변경이 실제로 적용되었는지 검증
+            if str(actual_new_value) == str(new_value):
+                success = True
+                final_var_data = test_data
+                print(f"[CHANGE-DEBUG] ✅ change_variable successful: '{current_value}' → '{actual_new_value}'")
+            else:
+                print(f"[CHANGE-DEBUG] ⚠️ change_variable may have failed: expected '{new_value}', got '{actual_new_value}'")
+                child_var = None  # 재시도를 위해 None으로 설정
+        else:
+            print(f"[CHANGE-DEBUG] ❌ change_variable returned None")
+    
+    except Exception as change_error:
+        print(f"[CHANGE-DEBUG] ❌ change_variable failed with exception: {change_error}")
+        child_var = None
+
+    # 방법 2: 직접 프레임 레벨 변경 시도 (change_variable 실패 시)
+    if not success and child_var is None:
+        print(f"[CHANGE-DEBUG] 🔧 Attempting direct frame-level change...")
+        
+        try:
+            # 스레드 및 프레임 ID 확인
+            thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+            
+            if thread_id:
+                frame = py_db.find_frame(thread_id, variables_reference)
+                
+                if frame is not None:
+                    print(f"[CHANGE-DEBUG] 🎯 Frame found, attempting direct change...")
+                    
+                    # 값을 안전하게 평가
+                    try:
+                        # 문자열인 경우 따옴표 처리
+                        if isinstance(new_value, str) and not new_value.startswith(("'", '"')):
+                            # 숫자나 불린 값인지 확인
+                            try:
+                                # 정수 시도
+                                evaluated_value = int(new_value)
+                            except ValueError:
+                                try:
+                                    # 실수 시도
+                                    evaluated_value = float(new_value)
+                                except ValueError:
+                                    # 불린 시도
+                                    if new_value.lower() in ('true', 'false'):
+                                        evaluated_value = new_value.lower() == 'true'
+                                    else:
+                                        # 문자열로 처리
+                                        evaluated_value = new_value
+                        else:
+                            # eval을 사용하여 평가 (안전한 컨텍스트에서)
+                            evaluated_value = eval(new_value, frame.f_globals, frame.f_locals)
+                        
+                        print(f"[CHANGE-DEBUG] 🔄 Evaluated value: {evaluated_value} (type: {type(evaluated_value).__name__})")
+                        
+                        # Scope에 따라 적절한 namespace에 값 설정
+                        if scope and hasattr(scope, 'scope') and scope.scope == "globals":
+                            frame.f_globals[variable_name] = evaluated_value
+                            verification_value = frame.f_globals.get(variable_name)
+                            print(f"[CHANGE-DEBUG] 🔧 Direct globals change applied")
+                        else:
+                            frame.f_locals[variable_name] = evaluated_value
+                            verification_value = frame.f_locals.get(variable_name)
+                            print(f"[CHANGE-DEBUG] 🔧 Direct locals change applied")
+                        
+                        print(f"[CHANGE-DEBUG] 📊 Verification value: '{verification_value}'")
+                        
+                        # 변경 성공 확인
+                        if str(verification_value) == str(evaluated_value):
+                            success = True
+                            print(f"[CHANGE-DEBUG] ✅ Direct change successful!")
+                            
+                            # final_var_data 직접 생성
+                            final_var_data = {
+                                "value": str(verification_value),
+                                "type": type(verification_value).__name__,
+                                "variablesReference": 0
+                            }
+                            
+                            # Mock child_var 생성
+                            class MockChildVar:
+                                def get_var_data(self, fmt=None):
+                                    return final_var_data
+                            
+                            child_var = MockChildVar()
+                        else:
+                            print(f"[CHANGE-DEBUG] ❌ Direct change verification failed")
+                            
+                    except Exception as eval_error:
+                        print(f"[CHANGE-DEBUG] ❌ Value evaluation failed: {eval_error}")
+                        
+                else:
+                    print(f"[CHANGE-DEBUG] ❌ Frame not found for direct change")
+            else:
+                print(f"[CHANGE-DEBUG] ❌ Thread ID not found for direct change")
+                
+        except Exception as direct_error:
+            print(f"[CHANGE-DEBUG] ❌ Direct change failed: {direct_error}")
+
+    # 🚨 모든 방법 실패 시 오류 응답
+    if not success or child_var is None:
+        print(f"[CHANGE-DEBUG] ❌ All change methods failed")
+        _write_variable_response(
+            py_db, request, value="", success=False, 
+            message="Unable to change: %s." % (variable_name,)
+        )
         return
 
-    var_data = child_var.get_var_data(fmt=fmt)
-    body = SetVariableResponseBody(
-        value=var_data["value"],
-        type=var_data["type"],
-        variablesReference=var_data.get("variablesReference"),
-        namedVariables=var_data.get("namedVariables"),
-        indexedVariables=var_data.get("indexedVariables"),
-    )
+    # ✅ 성공 시 응답 생성
+    print(f"[CHANGE-DEBUG] ✅ change_variable returned: {type(child_var).__name__}")
+    
+    # 최종 변수 데이터 가져오기
+    if final_var_data is None:
+        try:
+            final_var_data = child_var.get_var_data(fmt=fmt)
+        except Exception as data_error:
+            print(f"[CHANGE-DEBUG] ❌ get_var_data failed: {data_error}")
+            _write_variable_response(
+                py_db, request, value="", success=False,
+                message="Failed to get updated variable data: %s" % str(data_error)
+            )
+            return
+    
+    print(f"[CHANGE-DEBUG] 📊 Getting updated variable data...")
+    print(f"[CHANGE-DEBUG] ✅ var_data retrieved:")
+    print(f"[CHANGE-DEBUG]   value: '{final_var_data.get('value', 'N/A')}'")
+    print(f"[CHANGE-DEBUG]   type: '{final_var_data.get('type', 'N/A')}'")
+    print(f"[CHANGE-DEBUG]   variablesReference: {final_var_data.get('variablesReference', 0)}")
+    
+    # 🚀 UI 새로고침을 위한 응답 구조
+    print(f"[CHANGE-DEBUG] 🔄 Applying container-specific UI refresh...")
+    
+    response_value = final_var_data.get("value", "")
+    response_type = final_var_data.get("type") or "unknown"  # null 방지
+    response_ref = final_var_data.get("variablesReference", 0)
+    
+    body_kwargs = {
+        "value": str(response_value),
+        "type": response_type,
+        "variablesReference": response_ref,
+    }
+    
+    # 선택적 필드들 추가
+    if final_var_data.get("namedVariables") is not None:
+        body_kwargs["namedVariables"] = final_var_data["namedVariables"]
+    if final_var_data.get("indexedVariables") is not None:
+        body_kwargs["indexedVariables"] = final_var_data["indexedVariables"]
+    
+    body = SetVariableResponseBody(**body_kwargs)
+    
+    print(f"[CHANGE-DEBUG] 📤 Creating container-optimized response...")
     variables_response = pydevd_base_schema.build_response(request, kwargs={"body": body})
+    
+    # 표준 응답 전송
     py_db.writer.add_command(NetCommand(CMD_RETURN, 0, variables_response, is_json=True))
+    
+    # 🚀 UI 새로고침 이벤트 전송 (핵심!)
+    try:
+        thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+        if thread_id:
+            # Variables 창 무효화 이벤트
+            invalidate_event = {
+                "type": "event",
+                "event": "invalidated",
+                "body": {
+                    "areas": ["variables"],
+                    "threadId": thread_id,
+                    "stackFrameId": variables_reference
+                }
+            }
+            py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+            print(f"[UI-REFRESH] 🔄 Variables invalidation event sent for thread {thread_id}")
+            
+            # Console 알림 이벤트
+            output_event = {
+                "type": "event",
+                "event": "output",
+                "body": {
+                    "category": "console",
+                    "output": f"✅ {variable_name} = {response_value}\n"
+                }
+            }
+            py_db.writer.add_command(NetCommand(CMD_RETURN, 0, output_event, is_json=True))
+            print(f"[UI-REFRESH] 📢 Output notification sent: {variable_name} = {response_value}")
+            
+        else:
+            print(f"[UI-REFRESH] ⚠️ No thread_id found for UI refresh")
+            
+    except Exception as refresh_error:
+        print(f"[UI-REFRESH] ⚠️ UI refresh events failed (not critical): {refresh_error}")
+    
+    print(f"[CHANGE-DEBUG] ✅ Container-specific UI refresh applied")
+    print(f"[CHANGE-SUCCESS] 🎉 Variable '{variable_name}' ({type(variable).__name__}) changed to '{response_value}'")
+    print(f"[CHANGE-SUCCESS] 📱 Container-specific UI refresh applied")
 
 
 def _write_variable_response(py_db, request, value, success, message):
-    body = SetVariableResponseBody("")
-    variables_response = pydevd_base_schema.build_response(request, kwargs={"body": body, "success": False, "message": message})
-    cmd = NetCommand(CMD_RETURN, 0, variables_response, is_json=True)
-    py_db.writer.add_command(cmd)
+    """SetVariable 오류 응답 (개선된 버전)"""
+    print(f"[CHANGE-DEBUG] ❌ Writing error response:")
+    print(f"[CHANGE-DEBUG]   success: {success}")
+    print(f"[CHANGE-DEBUG]   message: '{message}'")
+    print(f"[CHANGE-DEBUG]   value: '{value}'")
+    
+    body = SetVariableResponseBody(value=value, type="<e>", variablesReference=0)
+    variables_response = pydevd_base_schema.build_response(
+        request, 
+        kwargs={
+            "body": body, 
+            "success": success, 
+            "message": message
+        }
+    )
+    py_db.writer.add_command(NetCommand(CMD_RETURN, 0, variables_response, is_json=True))
+    
+    # 오류도 사용자에게 알림
+    if not success:
+        error_output = {
+            "type": "event",
+            "event": "output",
+            "body": {
+                "category": "stderr", 
+                "output": f"❌ Variable change failed: {message}\n"
+            }
+        }
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, error_output, is_json=True))
+        print(f"[CHANGE-DEBUG] ❌ Error response sent to VS Code")
 
+
+def _create_presentation_hint_for_changed_variable(variable_name, var_type, scope):
+    """변경된 변수를 위한 presentationHint 생성"""
+    hint = {
+        "kind": "data",
+        "attributes": ["modified"]  # 수정됨을 명시
+    }
+    
+    # 변수 타입별 힌트
+    if var_type in ["list", "dict", "set", "tuple"]:
+        hint["attributes"].append("hasObjectId")
+    elif var_type in ["int", "float", "str", "bool"]:
+        hint["kind"] = "data"
+    elif var_type in ["function", "method"]:
+        hint["kind"] = "method"
+        hint["attributes"].append("readOnly")
+    
+    # Scope별 가시성
+    if scope and hasattr(scope, 'scope'):
+        if scope.scope == "locals":
+            hint["visibility"] = "public"
+        elif scope.scope == "globals":
+            hint["visibility"] = "internal"
+    else:
+        hint["visibility"] = "public"
+    
+    return hint
+
+
+def _apply_frame_variable_ui_refresh(py_db, variables_reference, variable_name, var_data):
+    """_FrameVariable 컨테이너의 UI 새로고침"""
+    print(f"[FRAME-REFRESH] Applying frame variable refresh for '{variable_name}'")
+    
+    # Frame 변수는 일반적으로 locals/globals scope
+    thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+    if thread_id:
+        # 특정 프레임의 변수 영역 무효화
+        invalidate_event = {
+            "type": "event",
+            "event": "invalidated", 
+            "body": {
+                "areas": ["variables"],
+                "threadId": thread_id,
+                "stackFrameId": variables_reference
+            }
+        }
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+        print(f"[FRAME-REFRESH] Frame invalidation event sent")
+
+
+def _apply_object_variable_ui_refresh(py_db, variables_reference, variable_name, var_data):
+    """_ObjectVariable 컨테이너의 UI 새로고침"""
+    print(f"[OBJECT-REFRESH] Applying object variable refresh for '{variable_name}'")
+    
+    # 객체 변수는 부모 컨테이너도 새로고침 필요할 수 있음
+    thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+    if thread_id:
+        # 현재 변수 참조 영역 무효화
+        invalidate_event = {
+            "type": "event",
+            "event": "invalidated",
+            "body": {
+                "areas": ["variables"],
+                "threadId": thread_id
+            }
+        }
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+        print(f"[OBJECT-REFRESH] Object invalidation event sent")
+
+
+def _apply_generic_variable_ui_refresh(py_db, variables_reference, variable_name, var_data):
+    """일반 변수 컨테이너의 UI 새로고침"""
+    print(f"[GENERIC-REFRESH] Applying generic variable refresh for '{variable_name}'")
+    
+    thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+    if thread_id:
+        invalidate_event = {
+            "type": "event",
+            "event": "invalidated",
+            "body": {
+                "areas": ["variables"],
+                "threadId": thread_id
+            }
+        }
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+        print(f"[GENERIC-REFRESH] Generic invalidation event sent")
+
+
+def _trigger_ui_refresh_events(py_db, variables_reference, variable_name, var_data):
+    """VS Code UI 새로고침을 위한 이벤트들 전송"""
+    try:
+        thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+        if not thread_id:
+            print(f"[UI-REFRESH] ⚠️ No thread_id found for variables_reference {variables_reference}")
+            return
+        
+        # 🚀 방법 1: Variables 영역 무효화 (가장 효과적)
+        invalidate_event = {
+            "type": "event",
+            "event": "invalidated",
+            "body": {
+                "areas": ["variables"],  # Variables 창 새로고침
+                "threadId": thread_id,
+                "stackFrameId": variables_reference
+            }
+        }
+        
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+        print(f"[UI-REFRESH] 🔄 Variables invalidation event sent for thread {thread_id}")
+        
+        # 🚀 방법 2: Output 이벤트로 사용자 알림
+        value_preview = str(var_data.get("value", ""))[:50]
+        if len(str(var_data.get("value", ""))) > 50:
+            value_preview += "..."
+            
+        output_event = {
+            "type": "event",
+            "event": "output",
+            "body": {
+                "category": "console",
+                "output": f"✅ {variable_name} = {value_preview}\n"
+            }
+        }
+        
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, output_event, is_json=True))
+        print(f"[UI-REFRESH] 📢 Output notification sent: {variable_name} = {value_preview}")
+        
+    except Exception as refresh_error:
+        print(f"[UI-REFRESH] ❌ UI refresh events failed: {refresh_error}")
 
 @silence_warnings_decorator
 def internal_get_frame(dbg, seq, thread_id, frame_id):

@@ -54,6 +54,10 @@ def lambda_handler(event, context):
 
     my_car = Car("Toyota", "Corolla")
 
+    test_var = 42
+    test_str = "hello"
+    test_list = [1, 2, 3]
+
     a = 11
     b = 22
     c = a + b

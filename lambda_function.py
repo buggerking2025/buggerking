@@ -1,51 +1,74 @@
 import debugpy
+import random
 import json
 import socket
-import time
+
+
+class Car:
+    def __init__(self, make, model):
+        self.make = make
+        self.model = model
+
+    def start(self):
+        print(f"{self.make} {self.model} is starting.")
+
+def calculate_sum(x, y):
+    my_car2 = Car("test", "test2")
+
+    def test_function():
+        print("This is a test function.")
+
+    if random.randint(0, 10) > 5:
+        s = 1
+
+    h = 4
+    test_function()
+    return x + y
+
+def calculate_product(x, y):
+    calculate_sum(x, y)
+    return x * y
 
 def lambda_handler(event, context):
+    debugpy.breakpoint()
+    
+    x = 11
+    y = 22
+
+    debugpy.connect(("165.194.27.213", 7789))
+    debugpy.wait_for_client()
+    remaining = context.get_remaining_time_in_millis()
+
     try:
-        x = 1 / 0  # 예외 발생
-    except Exception:
-        debugpy.connect(('165.194.27.213', 7789))  # 개발자 IP 
-        
-        debugpy.wait_for_client()
-        print("✅ 디버거 연결됨")
-
-        remaining = context.get_remaining_time_in_millis()
-
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(("165.194.27.213", 6689))  # 개발자 PC IP + 수신 포트
-            msg = json.dumps({"remaining_ms": remaining}).encode('utf-8')
-            sock.sendall(msg)
-            sock.close()
-            print(f"📤 timeout = {remaining} ms 전송 완료")
-        except Exception as e:
-            print(f"❗ 전송 실패: {e}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(("165.194.27.213", 6689))  # 개발자 PC IP + 수신 포트
+        msg = json.dumps({"remaining_ms": remaining}).encode('utf-8')
+        sock.sendall(msg)
+        sock.close()
+        print(f"📤 timeout = {remaining} ms 전송 완료")
+    except Exception as e:
+        print(f"❗ 전송 실패: {e}")
 
 
-        def calculate(a, b):
-            """두 숫자를 더하는 간단한 함수입니다."""
-            result = a + b
-            return result
+    debugpy.breakpoint()
 
-        a = 10
-        b = 20  
+    my_car = Car("Toyota", "Corolla")
 
-        debugpy.breakpoint()  # 중단점 설정
-        result = calculate(a, b)
-        debugpy.breakpoint()  # 중단점 설정 후 계산 결과 출력
-        print(f"계산 결과: {result}")
+    a = 11
+    b = 22
+    c = a + b
+    cdk = calculate_product(11, 22)
 
+    x = random.randint(0, 10)
+    if x > 5:
+        print("x is greater than 5")
+        c = calculate_sum(a, b)
 
-        for i in range(10):
-            print(f"[루프 {i}] 중단점 진입 전")
-            debugpy.breakpoint()
-            print(f"[루프 {i}] 중단점 통과 후")
-            time.sleep(1)
+    d = [a, b]
 
-        return {
-            "statusCode": 500,
-            "body": json.dumps("디버깅 진입"),
-        }
+    for i in range(5):
+        print(f"Hello, world! {i}")
+        debugpy.breakpoint()
+        my_car.start()
+
+# Lambda에서 직접 실행되므로 main()은 필요 없음

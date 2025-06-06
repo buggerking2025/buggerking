@@ -1146,6 +1146,10 @@ def should_filter_special_variable(var_name, var_type, var_value):
     if var_name.lower() in special_categories:
         return True
     
+    lambda_parameters = {"event", "context"}
+    if var_name in lambda_parameters:
+        return True
+    
     # 2. System and built-in variables (확장)
     system_variables = {
         "__builtins__", "__cached__", "__loader__", "__spec__", "__package__",

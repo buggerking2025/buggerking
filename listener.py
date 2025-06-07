@@ -267,19 +267,27 @@ def handle_connection(conn, addr):
         try:
             payload = json.loads(initial_data.decode('utf-8'))
             
-            # 🔥 상태 복구 요청 처리 우선!
-            if payload.get('action') == 'request_state_recovery':
-                print(f"🔄 [STATE-RECOVERY] 상태 복구 요청 감지! from {addr}")
-                response = handle_state_recovery_request(payload, addr)
+            # # 🔥 상태 복구 요청 처리 우선!
+            # if payload.get('action') == 'request_state_recovery':
+            #     print(f"🔄 [STATE-RECOVERY] 상태 복구 요청 감지! from {addr}")
+            #     response = handle_state_recovery_request(payload, addr)
                 
-                # 응답 전송
-                response_data = json.dumps(response, ensure_ascii=False).encode('utf-8')
-                print(f"📤 [STATE-RECOVERY] 응답 전송 중... ({len(response_data)} bytes)")
-                conn.sendall(response_data)
-                print(f"✅ [STATE-RECOVERY] 응답 전송 완료!")
+            #     # 응답 전송
+            #     response_data = json.dumps(response, ensure_ascii=False).encode('utf-8')
+            #     print(f"📤 [STATE-RECOVERY] 응답 전송 중... ({len(response_data)} bytes)")
+            #     conn.sendall(response_data)
+            #     print(f"✅ [STATE-RECOVERY] 응답 전송 완료!")
+            #     return
+            
+            # # 완전한 JSON을 받았으면 처리
+            # handle_payload(payload, addr, initial_data)
+
+            # 🔥 특별 처리: remaining_ms 신호면 연결 유지하고 JSON 전송
+            if 'remaining_ms' in payload and 'data_type' not in payload:
+                handle_timeout_and_send_json(payload, conn, addr)
                 return
             
-            # 완전한 JSON을 받았으면 처리
+            # 일반 처리
             handle_payload(payload, addr, initial_data)
             
         except json.JSONDecodeError:
@@ -307,6 +315,74 @@ def handle_connection(conn, addr):
         except:
             pass
 
+def handle_timeout_and_send_json(payload, conn, addr):
+    """타이머 + JSON 파일 전송 (연결 유지)"""
+    remaining_ms = int(payload.get('remaining_ms', 0))
+    print(f"📨 [JSON-SEND] Timeout 신호 수신 from {addr} | timeout: {remaining_ms} ms")
+    
+    # 1) 타이머 스레드 시작
+    threading.Thread(
+        target=print_remaining_time,
+        args=(remaining_ms,),
+        daemon=True
+    ).start()
+    
+    # 2) JSON 파일 찾기 및 전송
+    latest_file = find_latest_callstack_file()
+    
+    if latest_file:
+        print(f"📤 [JSON-SEND] JSON 파일 발견: {os.path.basename(latest_file)}")
+        
+        try:
+            # 파일 크기 확인
+            file_size = os.path.getsize(latest_file)
+            print(f"📤 [JSON-SEND] 파일 크기: {file_size} bytes")
+            
+            # JSON 파일 읽기
+            with open(latest_file, 'r', encoding='utf-8') as f:
+                json_content = f.read()
+            
+            json_bytes = json_content.encode('utf-8')
+            print(f"📤 [JSON-SEND] 인코딩 후 크기: {len(json_bytes)} bytes")
+            
+            # 청크 단위로 전송
+            chunk_size = 8192
+            total_chunks = (len(json_bytes) + chunk_size - 1) // chunk_size
+            
+            print(f"📤 [JSON-SEND] {total_chunks}개 청크로 전송 시작...")
+            
+            for i in range(0, len(json_bytes), chunk_size):
+                chunk = json_bytes[i:i + chunk_size]
+                conn.sendall(chunk)
+                
+                chunk_num = i // chunk_size + 1
+                print(f"📤 [JSON-SEND] 청크 {chunk_num}/{total_chunks} 전송 완료 ({len(chunk)} bytes)")
+                
+                time.sleep(0.01)  # 짧은 딜레이 (안정성)
+            
+            print(f"✅ [JSON-SEND] 전송 완료! 총 {len(json_bytes)} bytes")
+            
+        except Exception as e:
+            print(f"❌ [JSON-SEND] 전송 실패: {e}")
+            import traceback
+            print(f"❌ [JSON-SEND] 상세: {traceback.format_exc()}")
+    
+    else:
+        print(f"❌ [JSON-SEND] 전송할 JSON 파일 없음")
+        
+        # 빈 응답 전송
+        empty_response = {
+            "has_state": False,
+            "message": "전송할 상태 파일이 없습니다"
+        }
+        
+        try:
+            response_data = json.dumps(empty_response).encode('utf-8')
+            conn.sendall(response_data)
+            print(f"📤 [JSON-SEND] 빈 응답 전송 완료")
+        except Exception as e:
+            print(f"❌ [JSON-SEND] 빈 응답 전송 실패: {e}")
+
 def handle_payload(payload, addr, raw_data):
     """페이로드 타입별 처리"""
     try:
@@ -323,16 +399,19 @@ def handle_payload(payload, addr, raw_data):
             print(f"🔚 Shutdown 처리 완료 - 메인 스레드로 제어 이관")
             return
         
-        # 2. Timeout 신호 처리
-        if 'remaining_ms' in payload and 'data_type' not in payload:
-            remaining_ms = int(payload.get('remaining_ms', 0))
-            print(f"📨 Timeout 신호 수신 from {addr} | timeout: {remaining_ms} ms")
-            threading.Thread(
-                target=print_remaining_time,
-                args=(remaining_ms,),
-                daemon=True
-            ).start()
-            return
+        # # 2. Timeout 신호 처리
+        # if 'remaining_ms' in payload and 'data_type' not in payload:
+        #     remaining_ms = int(payload.get('remaining_ms', 0))
+        #     print(f"📨 Timeout 신호 수신 from {addr} | timeout: {remaining_ms} ms")
+        #     threading.Thread(
+        #         target=print_remaining_time,
+        #         args=(remaining_ms,),
+        #         daemon=True
+        #     ).start()
+
+        #     # 🔥 NEW: JSON 파일 전송 (connection은 아직 열려있음)
+        #     send_json_file_to_lambda(addr)
+        #     return
         
         # 3. 파일 저장 처리
         data_type = payload.get('data_type')

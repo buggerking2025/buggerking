@@ -67,7 +67,7 @@ def wait_for_debugpy():
 
 # Lambda 호출 (예외 트리거 & remote attach 유도)
 def invoke_lambda():
-    url = "https://8ddph17th5.execute-api.us-east-1.amazonaws.com/default/testcapture"
+    url = "https://8ddph17th5.execute-api.us-east-1.amazonaws.com/default/testcapture?reinvoked=true"
     print("[🌐] Lambda 호출 중...")
     try:
         resp = requests.post(url, json={})

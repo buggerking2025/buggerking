@@ -1207,8 +1207,27 @@ def should_filter_special_variable(var_name, var_type, var_value):
         if module_name in builtin_modules:
             return True
     
-    # 5. Private 변수들 (더 엄격하게)
+    # 5. Name mangling 감지 함수
+    def is_name_mangled_private_field(name):
+        """Name mangling된 private field인지 확인 (_ClassName__fieldname 패턴)"""
+        if not name.startswith("_"):
+            return False
+        
+        # _ClassName__fieldname 패턴 확인
+        parts = name[1:].split("__", 1)  # 첫 번째 _를 제거하고 __로 분할
+        if len(parts) == 2:
+            class_name, field_name = parts
+            # 클래스명이 비어있지 않고, 필드명도 비어있지 않아야 함
+            if class_name and field_name and class_name[0].isupper():
+                return True
+        return False
+    
+    # 5. Private 변수들 (name mangling된 private field는 제외)
     if var_name.startswith("_") and not var_name.startswith("__"):
+        # Name mangling된 private field는 필터링하지 않음
+        if is_name_mangled_private_field(var_name):
+            return False
+        
         important_privates = {"_", "_1", "_2", "_3", "_last_traceback"}
         if var_name not in important_privates and len(var_name) > 2:
             return True
@@ -1223,7 +1242,7 @@ def should_filter_special_variable(var_name, var_type, var_value):
             return True
     
     # 7. 큰 컬렉션의 내부 구현
-    if var_type in ["dict_keys", "dict_values", "dict_items", "range", 
+    if var_type in ["dict_keys", "dict_values", "dict_items", "range",
                     "enumerate", "zip", "filter", "map"]:
         return True
     
@@ -1561,9 +1580,36 @@ def get_stacks_accurate_callstack(py_db, thread_id=None):
 #         print(f"[STACKS] Error saving debug dump: {e}")
 #         return None
     
-def send_file_to_local(file_path, data_type="debug_data"):
-    """람다에서 로컬 PC로 파일 전송 (기존 socket_module 사용)"""
+def send_dap_message_to_local(sock, data):
+    """DAP 표준 형식으로 데이터 전송 (pydevd_comm용)"""
     try:
+        # JSON 데이터를 바이트로 변환
+        if isinstance(data, dict):
+            data_bytes = json.dumps(data, ensure_ascii=True).encode('utf-8')
+        elif isinstance(data, str):
+            data_bytes = data.encode('utf-8')
+        else:
+            data_bytes = data
+        
+        # DAP 헤더 생성
+        content_length = len(data_bytes)
+        header = f"Content-Length: {content_length}\r\n\r\n".encode('ascii')
+        
+        # 헤더 + 데이터 전송
+        sock.sendall(header + data_bytes)
+        
+        print(f"📤 [DAP-PYDEVD] 전송 완료: {content_length} bytes")
+        return True
+        
+    except Exception as e:
+        print(f"❌ [DAP-PYDEVD] 전송 실패: {e}")
+        return False
+
+def send_file_to_local(file_path, data_type="debug_data"):
+    """람다에서 로컬 PC로 파일 전송 (DAP 방식으로 수정)"""
+    try:
+        print(f"📤 [FILE-SEND] 파일 전송 시작: {os.path.basename(file_path)}")
+        
         # 파일 내용 읽기
         with open(file_path, 'r', encoding='utf-8') as f:
             file_content = f.read()
@@ -1578,39 +1624,38 @@ def send_file_to_local(file_path, data_type="debug_data"):
             "source": "lambda_debugger"
         }
         
-        # JSON 직렬화
-        json_data = json.dumps(payload, ensure_ascii=True)
-        data_bytes = json_data.encode('utf-8')
+        print(f"📤 [FILE-SEND] 페이로드 크기: {len(file_content)} chars")
         
-        # 소켓 연결 및 전송 (파일 상단의 socket_module 사용)
+        # 소켓 연결 및 전송
         sock = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
         
         try:
-            sock.settimeout(10.0)  # 10초 타임아웃
+            sock.settimeout(15.0)  # 15초 타임아웃 (더 여유있게)
+            print(f"📤 [FILE-SEND] 연결 시도...")
             sock.connect(("165.194.27.213", 6689))
+            print(f"📤 [FILE-SEND] 연결 성공!")
             
-            # 데이터 크기가 클 수 있으므로 청크 단위로 전송
-            total_sent = 0
-            while total_sent < len(data_bytes):
-                chunk = data_bytes[total_sent:total_sent + 8192]
-                sent = sock.send(chunk)
-                if sent == 0:
-                    raise RuntimeError("소켓 연결이 끊어짐")
-                total_sent += sent
+            # DAP 방식으로 전송
+            success = send_dap_message_to_local(sock, payload)
             
-            print(f"📤 파일 전송 완료: {os.path.basename(file_path)} ({len(file_content)} bytes)")
-            return True
+            if success:
+                print(f"📤 [FILE-SEND] DAP 전송 완료: {os.path.basename(file_path)}")
+                return True
+            else:
+                print(f"❌ [FILE-SEND] DAP 전송 실패")
+                return False
             
         finally:
             try:
                 sock.close()
+                print(f"📤 [FILE-SEND] 소켓 닫음")
             except:
                 pass
         
     except Exception as e:
-        print(f"❗ 파일 전송 실패 ({file_path}): {e}")
+        print(f"❗ [FILE-SEND] 파일 전송 실패 ({file_path}): {e}")
         import traceback
-        print(f"❗ 상세 에러: {traceback.format_exc()}")
+        print(f"❗ [FILE-SEND] 상세 에러: {traceback.format_exc()}")
         return False
     
 @silence_warnings_decorator
@@ -2249,7 +2294,6 @@ def calculate_recursive_stats(variables_with_children):
         "max_recursive_depth": max_depth,
         "collection_timestamp": datetime.now().isoformat()
     }
-
 
 class InternalGetVariable(InternalThreadCommand):
     """gets the value of a variable"""

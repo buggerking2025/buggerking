@@ -3,8 +3,78 @@ import json
 import socket
 import time
 
+def send_dap_message(sock, data):
+    """DAP 표준 형식으로 데이터 전송"""
+    try:
+        # JSON 데이터를 바이트로 변환
+        if isinstance(data, dict):
+            data_bytes = json.dumps(data).encode('utf-8')
+        elif isinstance(data, str):
+            data_bytes = data.encode('utf-8')
+        else:
+            data_bytes = data
+        
+        # DAP 헤더 생성
+        content_length = len(data_bytes)
+        header = f"Content-Length: {content_length}\r\n\r\n".encode('ascii')
+        
+        # 헤더 + 데이터 전송
+        sock.sendall(header + data_bytes)
+        
+        print(f"📤 [DAP-SEND] 전송 완료: {content_length} bytes")
+        return True
+        
+    except Exception as e:
+        print(f"❌ [DAP-SEND] 전송 실패: {e}")
+        return False
+
+def receive_dap_message(sock):
+    """DAP 표준 형식으로 데이터 수신"""
+    try:
+        print("📥 [DAP-RECV] 메시지 수신 시작...")
+        
+        # 1단계: 헤더 읽기
+        header_data = b""
+        while b"\r\n\r\n" not in header_data:
+            chunk = sock.recv(1024)
+            if not chunk:
+                print("❌ [DAP-RECV] 연결 종료됨 (헤더 읽기 중)")
+                return None
+            header_data += chunk
+        
+        # 2단계: Content-Length 파싱
+        header_str = header_data.decode('ascii')
+        content_length = None
+        for line in header_str.split('\r\n'):
+            if line.startswith('Content-Length:'):
+                content_length = int(line.split(':', 1)[1].strip())
+                break
+        
+        if content_length is None:
+            print("❌ [DAP-RECV] Content-Length 헤더 없음")
+            return None
+        
+        print(f"📥 [DAP-RECV] Content-Length: {content_length}")
+        
+        # 3단계: 정확한 크기만큼 데이터 읽기
+        data_bytes = b""
+        while len(data_bytes) < content_length:
+            remaining = content_length - len(data_bytes)
+            chunk = sock.recv(min(remaining, 8192))
+            if not chunk:
+                print("❌ [DAP-RECV] 연결 종료됨 (데이터 읽기 중)")
+                return None
+            data_bytes += chunk
+        
+        print(f"✅ [DAP-RECV] 수신 완료: {len(data_bytes)} bytes")
+        return data_bytes
+        
+    except Exception as e:
+        print(f"❌ [DAP-RECV] 수신 오류: {e}")
+        return None
+
 def request_previous_state(reinvoked=False):
-    """개발자 PC에서 이전 디버깅 상태 요청"""
+    """개발자 PC에서 이전 디버깅 상태 요청 - DAP 방식"""
     print("🔄 [REQUEST-STATE] 이전 디버깅 상태 요청 시작...")
     if reinvoked:
         print("🔁 [REQUEST-STATE] 재호출로 인한 상태 복구 시도")
@@ -16,26 +86,8 @@ def request_previous_state(reinvoked=False):
             sock.connect(("165.194.27.213", 6689))
             print("✅ [REQUEST-STATE] 연결 성공!")
             
-            
-            # 응답 수신 (큰 JSON 파일 대응)
-            print("📥 [REQUEST-STATE] 응답 수신 시작...")
-            response_data = b""
-            
-            while True:
-                chunk = sock.recv(8192)  # 8KB씩 수신
-                if not chunk:
-                    break
-                response_data += chunk
-                print(f"📥 [REQUEST-STATE] 청크 수신: {len(chunk)} bytes (총: {len(response_data)} bytes)")
-                
-                # JSON 완성 체크
-                try:
-                    json.loads(response_data.decode('utf-8'))
-                    print("✅ [REQUEST-STATE] 완전한 JSON 수신 감지!")
-                    break
-                except json.JSONDecodeError:
-                    print("⏳ [REQUEST-STATE] JSON 수신 중...")
-                    continue
+            # DAP 방식으로 응답 수신
+            response_data = receive_dap_message(sock)
             
             sock.close()
             
@@ -141,6 +193,28 @@ def request_previous_state(reinvoked=False):
             import traceback
             print(f"❌ [REQUEST-STATE] 상세 오류: {traceback.format_exc()}")
             return False
+        
+
+class Car:
+    def __init__(self, make, model):
+        self.make = make
+        self.model = model
+        self.__private_variable = "sexy guy"
+
+    def start(self):
+        print(f"{self.make} {self.model} is starting.")
+
+car1 = Car(make="Hyundai", model="Sonata")
+car2 = Car(make="Kia", model="K5")
+car3 = Car(make="Tesla", model="Model S")
+carlist = [car1, car2, car3]
+
+class Engine:
+    def __init__(self, cc, fuel):
+        self.cc = cc
+        self.fuel = fuel
+        self.__private_variable = "sexy engine"
+
 
 def lambda_handler(event, context):
     print("🚀 Lambda 핸들러 시작!")
@@ -160,13 +234,24 @@ def lambda_handler(event, context):
         else:
             print("❌ 상태 복구 실패 또는 복구할 상태 없음")
     else:
-        print("🌟 실패!")
+        print("🌟 첫 번째 실행!")
     
     print("-" * 60)
     print("🐛 일반 디버깅 시작...")
     
     # 기존 디버깅 코드
     try:
+        # Engine 객체 생성
+        my_engine = Engine(cc=2000, fuel="gasoline")
+
+        # Car 객체 생성 및 Engine 객체 할당
+        my_car = Car(make="Hyundai", model=my_engine)
+
+        my_car.start()
+        print(f"My car's engine: {my_car.model.cc}cc {my_car.model.fuel}")
+
+        testlist = [1, 2, 3, 4, 5]
+
         x = 1 / 0  # 예외 발생
     except Exception:
         debugpy.connect(('165.194.27.213', 7789))
@@ -180,20 +265,26 @@ def lambda_handler(event, context):
         sock.settimeout(30.0)  # 30초 타임아웃 설정
         sock.connect(("165.194.27.213", 6689))
         
-        # 1) remaining_ms 전송
-        msg = json.dumps({"remaining_ms": remaining}).encode('utf-8')
-        sock.sendall(msg)
-        print(f"📤 timeout = {remaining} ms 전송 완료")
+        # 1) remaining_ms 전송 (DAP 방식)
+        timeout_data = {"remaining_ms": remaining}
+        success = send_dap_message(sock, timeout_data)
+        
+        if success:
+            print(f"📤 timeout = {remaining} ms 전송 완료 (DAP)")
+        else:
+            print("❌ timeout 전송 실패")
+            sock.close()
+            return {
+                "statusCode": 500,
+                "body": json.dumps("timeout 전송 실패"),
+            }
         
         # 2) 첫 실행이 아니라면 JSON 응답 대기
-        params = event.get("queryStringParameters", {}) or {}
-        reinvoked = params.get("reinvoked") == "true"
-        
         if reinvoked:
             print("🔄 이전 상태 JSON 응답 대기 중...")
             
-            # JSON 응답 수신
-            json_data = receive_json_from_developer(sock)
+            # DAP 방식으로 JSON 수신
+            json_data = receive_dap_message(sock)
             
             if json_data:
                 print(f"✅ JSON 수신 성공! 크기: {len(json_data)} bytes")
@@ -218,7 +309,7 @@ def lambda_handler(event, context):
                             globals_count = len(variables.get('globals', []))
                             print(f"  - 변수 개수: locals={locals_count}, globals={globals_count}")
                     
-                    print("🎉 JSON 파일 전송 테스트 성공!")
+                    print("🎉 DAP JSON 파일 전송 테스트 성공!")
                     
                 except json.JSONDecodeError as e:
                     print(f"❌ JSON 파싱 실패: {e}")
@@ -243,43 +334,5 @@ def lambda_handler(event, context):
 
     return {
         "statusCode": 200,
-        "body": json.dumps("JSON 전송 테스트 완료"),
+        "body": json.dumps("DAP JSON 전송 테스트 완료"),
     }
-
-def receive_json_from_developer(sock):
-    """개발자로부터 JSON 파일 수신"""
-    try:
-        print("📥 JSON 수신 시작...")
-        all_data = b""
-        chunk_count = 0
-        
-        while True:
-            chunk = sock.recv(8192)  # 8KB씩 수신
-            if not chunk:
-                print("📥 수신 완료 (연결 종료)")
-                break
-                
-            all_data += chunk
-            chunk_count += 1
-            print(f"📥 청크 {chunk_count} 수신: {len(chunk)} bytes (총: {len(all_data)} bytes)")
-            
-            # JSON 완성도 체크
-            try:
-                json.loads(all_data.decode('utf-8'))
-                print(f"✅ 완전한 JSON 감지! 총 {chunk_count}개 청크")
-                break
-            except json.JSONDecodeError:
-                # 아직 불완전하면 계속 수신
-                continue
-            except UnicodeDecodeError:
-                # 인코딩 문제면 계속 수신
-                continue
-        
-        print(f"📥 최종 수신 완료: {len(all_data)} bytes")
-        return all_data
-        
-    except Exception as e:
-        print(f"❗ JSON 수신 오류: {e}")
-        import traceback
-        print(f"❗ 상세 오류: {traceback.format_exc()}")
-        return None

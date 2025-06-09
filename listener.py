@@ -1,4 +1,4 @@
-# listener.py - 상태 복구 기능 추가된 완전한 버전
+# listener.py - 상태 복구 기능 추가된 완전한 버전 (DAP 표준 적용)
 import socket
 import json
 import threading
@@ -99,116 +99,167 @@ def print_remaining_time(initial_ms):
             os.execv(sys.executable, [sys.executable] + sys.argv)
         time.sleep(0.5)
 
-# Lambda에서 보내는 대용량 데이터 수신 함수
-def receive_large_data(conn, expected_size=None):
-    """큰 데이터를 청크 단위로 안전하게 수신"""
+def send_dap_message(conn, data):
+    """DAP 표준 형식으로 데이터 전송"""
     try:
-        all_data = b""
-        
-        while True:
-            chunk = conn.recv(8192)  # 8KB씩 수신
-            if not chunk:
-                break
-            all_data += chunk
-            
-            # 예상 크기가 있으면 체크
-            if expected_size and len(all_data) >= expected_size:
-                break
-                
-            # JSON 종료 확인 (간단한 방법)
-            try:
-                json.loads(all_data.decode('utf-8'))
-                break  # 완전한 JSON이면 종료
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue  # 아직 불완전하면 계속 수신
-        
-        return all_data
-        
-    except Exception as e:
-        print(f"[❗] 대용량 데이터 수신 오류: {e}")
-        return b""
-
-def handle_state_recovery_request(payload, addr):
-    """Lambda 상태 복구 요청 처리"""
-    try:
-        print(f"🔄 [STATE-RECOVERY] 요청 정보:")
-        print(f"    세션 ID: {payload.get('lambda_session_id', 'unknown')}")
-        print(f"    함수명: {payload.get('function_name', 'unknown')}")
-        print(f"    타임스탬프: {payload.get('timestamp', 'unknown')}")
-        
-        # 가장 최근 callstack 파일 찾기
-        latest_file = find_latest_callstack_file()
-        
-        if latest_file:
-            print(f"✅ [STATE-RECOVERY] 최신 파일 발견: {os.path.basename(latest_file)}")
-            
-            # 파일 크기 확인
-            file_size = os.path.getsize(latest_file)
-            print(f"📏 [STATE-RECOVERY] 파일 크기: {file_size} bytes")
-            
-            # 파일 내용 읽기
-            with open(latest_file, 'r', encoding='utf-8') as f:
-                state_data = json.load(f)
-            
-            print(f"📊 [STATE-RECOVERY] JSON 로드 성공!")
-            print(f"📊 [STATE-RECOVERY] 최상위 키: {list(state_data.keys())}")
-            
-            total_locals = 0
-            total_globals = 0
-            
-            if "callstacks" in state_data:
-                callstack_count = len(state_data["callstacks"])
-                print(f"📊 [STATE-RECOVERY] callstacks 개수: {callstack_count}")
-                
-                # 통계 출력
-                for frame in state_data["callstacks"]:
-                    total_locals += len(frame.get("variables", {}).get("locals", []))
-                    total_globals += len(frame.get("variables", {}).get("globals", []))
-                
-                print(f"📊 [STATE-RECOVERY] 총 locals 변수: {total_locals}")
-                print(f"📊 [STATE-RECOVERY] 총 globals 변수: {total_globals}")
-            
-            # Lambda로 전송할 응답 구성
-            response = {
-                "has_state": True,
-                "state": state_data,
-                "restored_from": os.path.basename(latest_file),
-                "file_size": file_size,
-                "timestamp": datetime.datetime.now().isoformat(),
-                "message": "이전 디버깅 상태 복구 데이터 전송 완료",
-                "stats": {
-                    "total_frames": len(state_data.get("callstacks", [])),
-                    "total_locals": total_locals,
-                    "total_globals": total_globals
-                }
-            }
-            
-            print(f"📤 [STATE-RECOVERY] 응답 준비 완료 (has_state: True)")
-            
+        # JSON 데이터를 바이트로 변환
+        if isinstance(data, str):
+            data_bytes = data.encode('utf-8')
+        elif isinstance(data, dict):
+            data_bytes = json.dumps(data, ensure_ascii=False).encode('utf-8')
         else:
-            print(f"❌ [STATE-RECOVERY] 복구할 상태 파일 없음")
-            response = {
-                "has_state": False,
-                "message": "복구할 이전 디버깅 상태가 없습니다",
-                "timestamp": datetime.datetime.now().isoformat(),
-                "searched_directory": DEBUG_DATA_DIR
-            }
-            
-            print(f"📤 [STATE-RECOVERY] 응답 준비 완료 (has_state: False)")
+            data_bytes = data
         
-        return response
+        # DAP 헤더 생성
+        content_length = len(data_bytes)
+        header = f"Content-Length: {content_length}\r\n\r\n".encode('ascii')
+        
+        # 헤더 + 데이터 전송
+        conn.sendall(header + data_bytes)
+        
+        print(f"[📤] DAP 전송 완료: {content_length} bytes (헤더 포함)")
+        return True
         
     except Exception as e:
-        print(f"❌ [STATE-RECOVERY] 처리 오류: {e}")
-        import traceback
-        print(f"❌ [STATE-RECOVERY] 상세: {traceback.format_exc()}")
+        print(f"[❌] DAP 전송 실패: {e}")
+        return False
+
+def receive_message_with_fallback(conn):
+    """DAP 방식 시도 후 기존 방식으로 fallback"""
+    try:
+        print(f"[📥] 메시지 수신 시작 (DAP 우선, fallback 지원)")
         
-        error_response = {
-            "has_state": False,
-            "error": str(e),
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        return error_response
+        # 먼저 조금 읽어서 DAP 헤더인지 확인
+        conn.settimeout(2.0)  # 2초 타임아웃
+        initial_data = conn.recv(1024)  # 처음 1024바이트만
+
+        if not initial_data:
+            print(f"[❌] 연결 즉시 종료됨")
+            return None
+        
+        print(f"[📥] 초기 데이터: {repr(initial_data[:32])}")
+        
+        # DAP 헤더인지 확인
+        if initial_data.startswith(b"Content-Length:"):
+            print(f"[✅] DAP 형식 감지됨")
+            return receive_dap_message_continue(conn, initial_data)
+        else:
+            print(f"[⚠️] DAP 형식 아님 - 기존 방식으로 fallback")
+            return receive_legacy_message(conn, initial_data)
+            
+    except socket.timeout:
+        print(f"[❌] 초기 데이터 수신 타임아웃")
+        return None
+    except Exception as e:
+        print(f"[❌] 메시지 수신 오류: {e}")
+        return None
+
+def receive_dap_message_continue(conn, initial_data):
+    """이미 읽은 초기 데이터와 함께 DAP 메시지 완성"""
+    try:
+        # 헤더 완성까지 읽기
+        header_data = initial_data
+        while b"\r\n\r\n" not in header_data:
+            chunk = conn.recv(1024)
+            if not chunk:
+                print(f"[❌] DAP 헤더 읽기 중 연결 종료")
+                return None
+            header_data += chunk
+            
+            if len(header_data) > 1024:
+                print(f"[❌] DAP 헤더가 너무 김")
+                return None
+        
+        # Content-Length 파싱
+        try:
+            header_str = header_data.decode('ascii')
+            content_length = None
+            for line in header_str.split('\r\n'):
+                if line.startswith('Content-Length:'):
+                    content_length = int(line.split(':', 1)[1].strip())
+                    break
+            
+            if content_length is None:
+                print(f"[❌] Content-Length 파싱 실패")
+                return None
+                
+            print(f"[📥] DAP Content-Length: {content_length}")
+            
+        except (UnicodeDecodeError, ValueError) as e:
+            print(f"[❌] DAP 헤더 파싱 오류: {e}")
+            return None
+        
+        # 이미 읽은 데이터에서 실제 JSON 부분 추출
+        header_end_pos = header_data.find(b"\r\n\r\n") + 4
+        data_bytes = header_data[header_end_pos:]
+        
+        # 나머지 데이터 읽기
+        while len(data_bytes) < content_length:
+            remaining = content_length - len(data_bytes)
+            chunk = conn.recv(min(remaining, 8192))
+            if not chunk:
+                print(f"[❌] DAP 데이터 읽기 중 연결 종료")
+                return None
+            data_bytes += chunk
+        
+        print(f"[✅] DAP 수신 완료: {len(data_bytes)} bytes")
+        return data_bytes
+        
+    except Exception as e:
+        print(f"[❌] DAP 완성 오류: {e}")
+        return None
+
+def receive_legacy_message(conn, initial_data):
+    """기존 방식으로 JSON 수신 (JSON 파싱으로 완료 감지)"""
+    try:
+        print(f"[📥] 기존 방식으로 수신 중...")
+        
+        all_data = initial_data
+        json_complete = False
+        
+        # 초기 데이터로 JSON 완성 여부 확인
+        try:
+            json.loads(all_data.decode('utf-8'))
+            json_complete = True
+            print(f"[✅] 초기 데이터만으로 JSON 완성")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        
+        # JSON이 완성될 때까지 계속 읽기
+        while not json_complete:
+            try:
+                chunk = conn.recv(8192)
+                if not chunk:
+                    print(f"[❌] 기존 방식 수신 중 연결 종료")
+                    break
+                all_data += chunk
+                
+                # JSON 완성 여부 확인
+                try:
+                    json.loads(all_data.decode('utf-8'))
+                    json_complete = True
+                    print(f"[✅] JSON 완성 감지: {len(all_data)} bytes")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # 아직 불완전하면 계속
+                    if len(all_data) > 10 * 1024 * 1024:  # 10MB 제한
+                        print(f"[❌] 데이터가 너무 큼: {len(all_data)} bytes")
+                        return None
+                    continue
+                    
+            except socket.timeout:
+                print(f"[❌] 기존 방식 수신 타임아웃")
+                return None
+        
+        if json_complete:
+            print(f"[✅] 기존 방식 수신 완료: {len(all_data)} bytes")
+            return all_data
+        else:
+            print(f"[❌] JSON 완성되지 않음")
+            return None
+            
+    except Exception as e:
+        print(f"[❌] 기존 방식 수신 오류: {e}")
+        return None
 
 def find_latest_callstack_file():
     """가장 최근의 callstack 파일 찾기"""
@@ -250,73 +301,8 @@ def find_latest_callstack_file():
         print(f"❌ [FILE-SEARCH] 검색 오류: {e}")
         return None
 
-# Lambda에서 보내는 연결(타이머 / shutdown / 파일 저장 / 상태 복구) 처리
-def handle_connection(conn, addr):
-    global sock
-    try:
-        print(f"[🔗] 연결됨: {addr}")
-        
-        # 첫 번째 청크 수신
-        initial_data = conn.recv(1024)
-        
-        if not initial_data:
-            print(f"[❗] 빈 데이터 수신 from {addr}")
-            return
-        
-        # JSON 파싱 시도 (작은 데이터인지 확인)
-        try:
-            payload = json.loads(initial_data.decode('utf-8'))
-            
-            # # 🔥 상태 복구 요청 처리 우선!
-            # if payload.get('action') == 'request_state_recovery':
-            #     print(f"🔄 [STATE-RECOVERY] 상태 복구 요청 감지! from {addr}")
-            #     response = handle_state_recovery_request(payload, addr)
-                
-            #     # 응답 전송
-            #     response_data = json.dumps(response, ensure_ascii=False).encode('utf-8')
-            #     print(f"📤 [STATE-RECOVERY] 응답 전송 중... ({len(response_data)} bytes)")
-            #     conn.sendall(response_data)
-            #     print(f"✅ [STATE-RECOVERY] 응답 전송 완료!")
-            #     return
-            
-            # # 완전한 JSON을 받았으면 처리
-            # handle_payload(payload, addr, initial_data)
-
-            # 🔥 특별 처리: remaining_ms 신호면 연결 유지하고 JSON 전송
-            if 'remaining_ms' in payload and 'data_type' not in payload:
-                handle_timeout_and_send_json(payload, conn, addr)
-                return
-            
-            # 일반 처리
-            handle_payload(payload, addr, initial_data)
-            
-        except json.JSONDecodeError:
-            # 불완전한 JSON이면 나머지 데이터 수신
-            print(f"[📦] 대용량 데이터 감지 - 추가 수신 중...")
-            
-            remaining_data = receive_large_data(conn)
-            full_data = initial_data + remaining_data
-            
-            try:
-                payload = json.loads(full_data.decode('utf-8'))
-                handle_payload(payload, addr, full_data)
-                
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                print(f"[❗] JSON 파싱 실패 from {addr}: {e}")
-                print(f"[📏] 수신 데이터 크기: {len(full_data)} bytes")
-                
-    except Exception as e:
-        print(f"[❗] 연결 처리 오류 from {addr}: {e}")
-        import traceback
-        print(f"[❗] 상세 오류: {traceback.format_exc()}")
-    finally:
-        try:
-            conn.close()
-        except:
-            pass
-
 def handle_timeout_and_send_json(payload, conn, addr):
-    """타이머 + JSON 파일 전송 (연결 유지)"""
+    """타이머 + JSON 파일 전송 (연결 유지) - DAP 방식"""
     remaining_ms = int(payload.get('remaining_ms', 0))
     print(f"📨 [JSON-SEND] Timeout 신호 수신 from {addr} | timeout: {remaining_ms} ms")
     
@@ -342,46 +328,83 @@ def handle_timeout_and_send_json(payload, conn, addr):
             with open(latest_file, 'r', encoding='utf-8') as f:
                 json_content = f.read()
             
-            json_bytes = json_content.encode('utf-8')
-            print(f"📤 [JSON-SEND] 인코딩 후 크기: {len(json_bytes)} bytes")
+            print(f"📤 [JSON-SEND] 파일 내용 읽기 완료: {len(json_content)} chars")
             
-            # 청크 단위로 전송
-            chunk_size = 8192
-            total_chunks = (len(json_bytes) + chunk_size - 1) // chunk_size
+            # DAP 방식으로 전송
+            success = send_dap_message(conn, json_content)
             
-            print(f"📤 [JSON-SEND] {total_chunks}개 청크로 전송 시작...")
-            
-            for i in range(0, len(json_bytes), chunk_size):
-                chunk = json_bytes[i:i + chunk_size]
-                conn.sendall(chunk)
-                
-                chunk_num = i // chunk_size + 1
-                print(f"📤 [JSON-SEND] 청크 {chunk_num}/{total_chunks} 전송 완료 ({len(chunk)} bytes)")
-                
-                time.sleep(0.01)  # 짧은 딜레이 (안정성)
-            
-            print(f"✅ [JSON-SEND] 전송 완료! 총 {len(json_bytes)} bytes")
+            if success:
+                print(f"✅ [JSON-SEND] DAP 전송 완료! 총 {len(json_content)} chars")
+            else:
+                print(f"❌ [JSON-SEND] DAP 전송 실패!")
             
         except Exception as e:
             print(f"❌ [JSON-SEND] 전송 실패: {e}")
             import traceback
             print(f"❌ [JSON-SEND] 상세: {traceback.format_exc()}")
+            
+            # 오류 응답도 DAP 방식으로
+            error_response = {
+                "has_state": False,
+                "error": str(e),
+                "message": "파일 읽기 실패"
+            }
+            send_dap_message(conn, error_response)
     
     else:
         print(f"❌ [JSON-SEND] 전송할 JSON 파일 없음")
         
-        # 빈 응답 전송
+        # 빈 응답도 DAP 방식으로 전송
         empty_response = {
             "has_state": False,
             "message": "전송할 상태 파일이 없습니다"
         }
         
         try:
-            response_data = json.dumps(empty_response).encode('utf-8')
-            conn.sendall(response_data)
+            send_dap_message(conn, empty_response)
             print(f"📤 [JSON-SEND] 빈 응답 전송 완료")
         except Exception as e:
             print(f"❌ [JSON-SEND] 빈 응답 전송 실패: {e}")
+
+# Lambda에서 보내는 연결(타이머 / shutdown / 파일 저장 / 상태 복구) 처리
+def handle_connection(conn, addr):
+    global sock
+    try:
+        print(f"[🔗] 연결됨: {addr}")
+        
+        # DAP 방식 시도, 실패 시 기존 방식으로 fallback
+        message_data = receive_message_with_fallback(conn)
+        
+        if not message_data:
+            print(f"[❗] 메시지 수신 실패 from {addr}")
+            return
+        
+        # JSON 파싱
+        try:
+            payload = json.loads(message_data.decode('utf-8'))
+            
+            # 🔥 특별 처리: remaining_ms 신호면 연결 유지하고 JSON 전송
+            if 'remaining_ms' in payload and 'data_type' not in payload:
+                handle_timeout_and_send_json(payload, conn, addr)
+                return
+            
+            # 일반 처리
+            handle_payload(payload, addr, message_data)
+            
+        except json.JSONDecodeError as e:
+            print(f"[❗] JSON 파싱 실패 from {addr}: {e}")
+            print(f"[📏] 수신 데이터 크기: {len(message_data)} bytes")
+            print(f"[📋] 데이터 미리보기: {message_data[:200]}")
+                
+    except Exception as e:
+        print(f"[❗] 연결 처리 오류 from {addr}: {e}")
+        import traceback
+        print(f"[❗] 상세 오류: {traceback.format_exc()}")
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
 
 def handle_payload(payload, addr, raw_data):
     """페이로드 타입별 처리"""
@@ -399,21 +422,7 @@ def handle_payload(payload, addr, raw_data):
             print(f"🔚 Shutdown 처리 완료 - 메인 스레드로 제어 이관")
             return
         
-        # # 2. Timeout 신호 처리
-        # if 'remaining_ms' in payload and 'data_type' not in payload:
-        #     remaining_ms = int(payload.get('remaining_ms', 0))
-        #     print(f"📨 Timeout 신호 수신 from {addr} | timeout: {remaining_ms} ms")
-        #     threading.Thread(
-        #         target=print_remaining_time,
-        #         args=(remaining_ms,),
-        #         daemon=True
-        #     ).start()
-
-        #     # 🔥 NEW: JSON 파일 전송 (connection은 아직 열려있음)
-        #     send_json_file_to_lambda(addr)
-        #     return
-        
-        # 3. 파일 저장 처리
+        # 2. 파일 저장 처리
         data_type = payload.get('data_type')
         if data_type:
             filename = payload.get('filename', f'debug_data_{int(time.time())}.json')
@@ -435,7 +444,7 @@ def handle_payload(payload, addr, raw_data):
             
             return
         
-        # 4. 기타 데이터 처리
+        # 3. 기타 데이터 처리
         print(f"❓ 알 수 없는 데이터 타입 from {addr}")
         print(f"📋 페이로드 키: {list(payload.keys())}")
         
@@ -453,10 +462,11 @@ def main():
     global sock
     
     print(f"""
-🚀 Enhanced Listener 시작
+🚀 Enhanced Listener 시작 (DAP 표준 적용)
 📅 시간: {datetime.datetime.now()}
 📂 저장 폴더: {DEBUG_DATA_DIR}
 🌐 리스닝 포트: {PORT}
+🔧 통신 방식: DAP (Debug Adapter Protocol)
 """)
     
     # 문제 매처를 위해 반드시 이 두 줄을 찍습니다.

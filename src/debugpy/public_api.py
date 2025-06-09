@@ -138,7 +138,7 @@ def connect(__endpoint: Endpoint | int, *, access_token: str | None = None) -> E
     ...
 
 @_api(cancelable=True)
-def wait_for_client() -> None:
+def wait_for_client(exception=None, context=None, restart=False) -> None:
     """If there is a client connected to the debug adapter that is
     debugging this process, returns immediately. Otherwise, blocks
     until a client connects to the adapter.

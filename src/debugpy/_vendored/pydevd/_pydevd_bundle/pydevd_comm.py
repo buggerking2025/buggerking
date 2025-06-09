@@ -135,7 +135,7 @@ from _pydevd_bundle.pydevd_comm_constants import *  # @UnusedWildImport
 
 import json
 from datetime import datetime
-
+import struct
 import threading
 
 # Socket import aliases:
@@ -1579,33 +1579,8 @@ def get_stacks_accurate_callstack(py_db, thread_id=None):
 #     except Exception as e:
 #         print(f"[STACKS] Error saving debug dump: {e}")
 #         return None
-    
-def send_dap_message_to_local(sock, data):
-    """DAP 표준 형식으로 데이터 전송 (pydevd_comm용)"""
-    try:
-        # JSON 데이터를 바이트로 변환
-        if isinstance(data, dict):
-            data_bytes = json.dumps(data, ensure_ascii=True).encode('utf-8')
-        elif isinstance(data, str):
-            data_bytes = data.encode('utf-8')
-        else:
-            data_bytes = data
-        
-        # DAP 헤더 생성
-        content_length = len(data_bytes)
-        header = f"Content-Length: {content_length}\r\n\r\n".encode('ascii')
-        
-        # 헤더 + 데이터 전송
-        sock.sendall(header + data_bytes)
-        
-        print(f"📤 [DAP-PYDEVD] 전송 완료: {content_length} bytes")
-        return True
-        
-    except Exception as e:
-        print(f"❌ [DAP-PYDEVD] 전송 실패: {e}")
-        return False
-
-def send_file_to_local(file_path, data_type="debug_data"):
+  
+def send_file_to_local(file_path):
     """람다에서 로컬 PC로 파일 전송 (DAP 방식으로 수정)"""
     try:
         print(f"📤 [FILE-SEND] 파일 전송 시작: {os.path.basename(file_path)}")
@@ -1614,18 +1589,14 @@ def send_file_to_local(file_path, data_type="debug_data"):
         with open(file_path, 'r', encoding='utf-8') as f:
             file_content = f.read()
         
-        # 전송할 페이로드 구성
-        payload = {
-            "data_type": data_type,
-            "filename": os.path.basename(file_path),
-            "content": file_content,
-            "file_size": len(file_content),
-            "timestamp": datetime.now().isoformat(),
-            "source": "lambda_debugger"
-        }
-        
-        print(f"📤 [FILE-SEND] 페이로드 크기: {len(file_content)} chars")
-        
+        try:
+            # 파일 내용을 JSON으로 파싱하여 딕셔너리로 변환
+            file_content_dict = json.loads(file_content)
+            print(f"ℹ️ [FILE-SEND] 파일 내용을 JSON 딕셔너리로 변환 성공.")
+        except Exception as e:
+            print(f"⚠️ [FILE-SEND] 파일 내용 변환 중 예기치 않은 오류: {e}. 원본 문자열로 전송합니다.")
+            file_content_dict = {"error": f"Unexpected error during content conversion: {e}", "raw_content": file_content}
+    
         # 소켓 연결 및 전송
         sock = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
         
@@ -1636,7 +1607,7 @@ def send_file_to_local(file_path, data_type="debug_data"):
             print(f"📤 [FILE-SEND] 연결 성공!")
             
             # DAP 방식으로 전송
-            success = send_dap_message_to_local(sock, payload)
+            success = send_dap_message(sock, file_content_dict, "CAPT")
             
             if success:
                 print(f"📤 [FILE-SEND] DAP 전송 완료: {os.path.basename(file_path)}")
@@ -1658,14 +1629,58 @@ def send_file_to_local(file_path, data_type="debug_data"):
         print(f"❗ [FILE-SEND] 상세 에러: {traceback.format_exc()}")
         return False
     
+def send_dap_message(sock, data, message_type_str: str):
+    """
+    지정된 타입과 데이터를 사용하여 고정 크기 헤더와 가변 크기 바디로 구성된 메시지를 전송합니다.
+    헤더는 4바이트 메시지 타입 문자열과 4바이트 바디 크기 정수로 구성됩니다. (총 8바이트 헤더)
+    수신측에서는 이 헤더를 먼저 읽고 파싱하여 바디의 크기를 알아낸 후, 해당 크기만큼 바디를 읽습니다.
+
+    :param sock: 소켓 객체
+    :param data: 전송할 데이터 (dict만 지원 - 자동으로 JSON 변환됨)
+    :param message_type_str: 메시지 타입을 나타내는 4자리 문자열 (예: "TIME", "SHUT", "CAPT").
+                             4자보다 짧으면 공백으로 패딩되고, 길면 4자로 절단됩니다.
+    :return: 성공 시 True, 실패 시 False
+    """
+    try:
+        # 모든 데이터는 dict → JSON으로 처리 (프로토콜 단순화)
+        if isinstance(data, dict):
+            body_bytes = json.dumps(data).encode('utf-8')
+        else:
+            error_msg = f"Unsupported data type: {type(data)}. Only dict is supported (automatically converted to JSON)."
+            print(f"❌ [DAP-SEND] 데이터 타입 오류 ({message_type_str}): {error_msg}")
+            raise TypeError(error_msg)
+
+        body_length = len(body_bytes)
+
+        # 헤더 생성 (총 8바이트)
+        # 1. 메시지 타입 (4바이트 ASCII)
+        type_str_fixed_length = message_type_str.ljust(4)[:4]
+        type_bytes_for_header = type_str_fixed_length.encode('ascii')
+
+        # 2. 바디 길이 (4바이트 big-endian unsigned integer)
+        body_length_bytes = struct.pack('>I', body_length)
+
+        header_bytes = type_bytes_for_header + body_length_bytes
+        
+        message_to_send = header_bytes + body_bytes
+        sock.sendall(message_to_send)
+        
+        total_sent = len(message_to_send)
+        print(f"📤 [DAP-SEND] '{message_type_str}' 전송 완료: header={len(header_bytes)}B, body={body_length}B. 총 {total_sent}B.")
+        return True
+        
+    except TypeError: 
+        return False 
+    except Exception as e:
+        print(f"❌ [DAP-SEND] '{message_type_str}' 전송 실패 (오류: {type(e).__name__}): {e}")
+        return False
+
+
 @silence_warnings_decorator
 def internal_get_variable_json(py_db, request):
     """
     람다용 변수 수집 + 재귀적 자식 변수 탐색 + 통합 파일 저장
     """
-    import os
-    import json
-    from datetime import datetime
     
     arguments = request.arguments
     variables_reference = arguments.variablesReference
@@ -1903,7 +1918,7 @@ def internal_get_variable_json(py_db, request):
         
         if scope_type == "globals" and current_frame_complete:
             print(f"[LAMBDA-DEBUG] 🚀 Frame {variables_reference} complete! Sending callstack file...")
-            success = send_file_to_local(session_filename, "unified_callstack_data")
+            success = send_file_to_local(session_filename)
             if success:
                 print(f"[LAMBDA-DEBUG] ✅ Callstack file sent successfully!")
                 # 전송 후에는 파일 유지 (다른 프레임이 추가될 수 있음)
@@ -2199,7 +2214,7 @@ def collect_recursive_children(py_db, var_data, current_depth=0, processed_refs=
             variable = frames_tracker.get_variable(variables_reference)
             children = variable.get_children_variables()
             
-            print(f"[FILTER-DEBUG] Depth {current_depth}: {var_name} ({var_type}) has {len(children)} children")
+            # print(f"[FILTER-DEBUG] Depth {current_depth}: {var_name} ({var_type}) has {len(children)} children")
             
             # 필터링된 자식들만 처리
             filtered_children = []
@@ -2224,7 +2239,7 @@ def collect_recursive_children(py_db, var_data, current_depth=0, processed_refs=
                     print(f"[FILTER-ERROR] Error checking child {i}: {child_error}")
                     continue
             
-            print(f"[FILTER-DEBUG] Filtered {len(children)} -> {len(filtered_children)} children for {var_name}")
+            # print(f"[FILTER-DEBUG] Filtered {len(children)} -> {len(filtered_children)} children for {var_name}")
             
             # 필터링된 자식들을 재귀적으로 처리
             for i, child_var in enumerate(filtered_children):

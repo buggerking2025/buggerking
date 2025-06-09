@@ -6,6 +6,7 @@ import platform
 import sys
 import socket
 from functools import partial
+import struct
 
 import pydevd_file_utils
 from _pydev_bundle import pydev_log
@@ -718,14 +719,72 @@ class PyDevJsonCommandProcessor(object):
             return "@HIT@ {}".format(expr)
 
         return hit_condition
+    
+    def send_dap_message(self, sock, data, message_type_str: str):
+        """
+        지정된 타입과 데이터를 사용하여 고정 크기 헤더와 가변 크기 바디로 구성된 메시지를 전송합니다.
+        헤더는 4바이트 메시지 타입 문자열과 4바이트 바디 크기 정수로 구성됩니다. (총 8바이트 헤더)
+        수신측에서는 이 헤더를 먼저 읽고 파싱하여 바디의 크기를 알아낸 후, 해당 크기만큼 바디를 읽습니다.
+
+        :param sock: 소켓 객체
+        :param data: 전송할 데이터 (dict만 지원 - 자동으로 JSON 변환됨)
+        :param message_type_str: 메시지 타입을 나타내는 4자리 문자열 (예: "TIME", "SHUT", "CAPT").
+                                4자보다 짧으면 공백으로 패딩되고, 길면 4자로 절단됩니다.
+        :return: 성공 시 True, 실패 시 False
+        """
+        try:
+            # 모든 데이터는 dict → JSON으로 처리 (프로토콜 단순화)
+            if isinstance(data, dict):
+                body_bytes = json.dumps(data).encode('utf-8')
+            else:
+                error_msg = f"Unsupported data type: {type(data)}. Only dict is supported (automatically converted to JSON)."
+                print(f"❌ [DAP-SEND] 데이터 타입 오류 ({message_type_str}): {error_msg}")
+                raise TypeError(error_msg)
+
+            body_length = len(body_bytes)
+
+            # 헤더 생성 (총 8바이트)
+            # 1. 메시지 타입 (4바이트 ASCII)
+            type_str_fixed_length = message_type_str.ljust(4)[:4]
+            type_bytes_for_header = type_str_fixed_length.encode('ascii')
+
+            # 2. 바디 길이 (4바이트 big-endian unsigned integer)
+            body_length_bytes = struct.pack('>I', body_length)
+
+            header_bytes = type_bytes_for_header + body_length_bytes
+            
+            message_to_send = header_bytes + body_bytes
+            sock.sendall(message_to_send)
+            
+            total_sent = len(message_to_send)
+            print(f"📤 [DAP-SEND] '{message_type_str}' 전송 완료: header={len(header_bytes)}B, body={body_length}B. 총 {total_sent}B.")
+            return True
+            
+        except TypeError: 
+            return False 
+        except Exception as e:
+            print(f"❌ [DAP-SEND] '{message_type_str}' 전송 실패 (오류: {type(e).__name__}): {e}")
+            return False
 
     def _send_shutdown_signal(self):
-        """Send shutdown signal to listener.py for all-in-one teardown."""
+        """Send shutdown signal to listener.py for all-in-one teardown using DAP protocol."""
         try:
-            with socket.create_connection(("165.194.27.213", 6689), timeout=1) as sock:
-                sock.sendall(json.dumps({"shutdown": True}).encode('utf-8'))
-        except Exception:
-            pass
+            with socket.create_connection(("165.194.27.213", 6689), timeout=3) as sock:
+                # DAP 규약에 맞게 헤더 + 바디 구조로 전송
+                shutdown_data = {"shutdown": True}
+                success = self.send_dap_message(sock, shutdown_data, 'SHUT')
+                
+                if success:
+                    print("📤 [SHUTDOWN] DAP 규약에 맞는 shutdown 신호 전송 완료")
+                else:
+                    print("❌ [SHUTDOWN] DAP shutdown 신호 전송 실패")
+                    
+        except socket.timeout:
+            print("⏰ [SHUTDOWN] listener 연결 타임아웃 - 이미 종료되었을 수 있음")
+        except ConnectionRefusedError:
+            print("🔌 [SHUTDOWN] listener 연결 거부 - 이미 종료되었을 수 있음")
+        except Exception as e:
+            print(f"❌ [SHUTDOWN] 예상치 못한 오류: {e}")
 
     def on_disconnect_request(self, py_db, request):
         """

@@ -860,8 +860,10 @@ class wait_for_client:
                     # with io.BytesIO(json_data) as f:
                     #     data = std_json.load(f)
                        
-                    capture_callstacks = json_data.get("callstacks", [])
-                    
+                    received_callstacks = json_data.get("callstacks", [])
+
+                    # 원치않은 call stack 프레임 제거
+                    capture_callstacks = [frame for frame in received_callstacks if frame.get("line") != -1]                    
                     
                     for i in range(len(capture_callstacks)):
                         function_name = capture_callstacks[i].get("function", "unknown_function")

@@ -1319,6 +1319,9 @@ def get_stacks_accurate_callstack(py_db, thread_id=None):
     ✅ stacks.py의 dump 함수 로직을 완전히 활용한 정확한 callstack 추출
     """
     try:
+        import traceback as tb_module
+        import threading
+        import sys
         current_tid = threading.current_thread().ident
         target_tid = current_tid
         
@@ -1351,7 +1354,7 @@ def get_stacks_accurate_callstack(py_db, thread_id=None):
                 break
         
         # traceback.format_stack() 사용 (stacks.py와 동일)
-        stack = traceback.format_stack(frame)
+        stack = tb_module.format_stack(frame)
         parsed_stack = []
         
         for entry in stack:
@@ -1430,8 +1433,8 @@ def get_stacks_accurate_callstack(py_db, thread_id=None):
         
     except Exception as e:
         print(f"[STACKS] Error in get_stacks_accurate_callstack: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback as tb_module
+        tb_module.print_exc()
         return []
 
 # def create_accurate_callstacks_with_variables(py_db, thread_id, current_variables_reference, current_locals, current_globals, max_levels=5):
@@ -1675,11 +1678,10 @@ def send_dap_message(sock, data, message_type_str: str):
         print(f"❌ [DAP-SEND] '{message_type_str}' 전송 실패 (오류: {type(e).__name__}): {e}")
         return False
 
-
 @silence_warnings_decorator
 def internal_get_variable_json(py_db, request):
     """
-    람다용 변수 수집 + 재귀적 자식 변수 탐색 + 통합 파일 저장
+    필터링된 완전한 콜스택 수집: 사용자 파일의 모든 프레임만 수집 (개선된 필터링 적용)
     """
     
     arguments = request.arguments
@@ -1697,257 +1699,413 @@ def internal_get_variable_json(py_db, request):
     if hasattr(fmt, "to_dict"):
         fmt = fmt.to_dict()
 
-    variables = []  # 기존 DAP 응답용
-    
-    print(f"[LAMBDA-DEBUG] Processing variables for reference: {variables_reference}, scope: {scope_type}")
+    print(f"[FILTERED-DEBUG] Processing variables for reference: {variables_reference}, scope: {scope_type}")
 
-    # 변수 수집
+    # VS Code 응답용 변수 수집 (요청된 scope만)
+    variables_for_vscode = []
     try:
-        try:
-            variable = py_db.suspended_frames_manager.get_variable(variables_reference)
-            print(f"[LAMBDA-DEBUG] ✅ Variable access successful: {type(variable).__name__} (scope: {scope_type})")
-                
-        except Exception as main_access_error:
-            print(f"[LAMBDA-DEBUG] ❌ Variable access failed: {main_access_error}")
-            pass
-        else:
-            # children 변수들 가져오기
+        variable = py_db.suspended_frames_manager.get_variable(variables_reference)
+        if variable:
+            children = variable.get_children_variables(fmt=fmt, scope=scope)
+            for child_var in children:
+                var_data = child_var.get_var_data(fmt=fmt)
+                variables_for_vscode.append(var_data)
+            print(f"[FILTERED-DEBUG] VS Code 응답용 {scope_type}: {len(variables_for_vscode)} variables")
+    except Exception as e:
+        print(f"[FILTERED-DEBUG] VS Code 응답 처리 실패: {e}")
+        variables_for_vscode = []
+
+    # 🚀 핵심: 개선된 필터링으로 사용자 파일의 전체 콜스택 강제 수집
+    try:
+        print(f"[FILTERED-DEBUG] 🔄 Starting improved filtered complete callstack collection...")
+        
+        thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+        if not thread_id:
+            print(f"[FILTERED-DEBUG] ❌ No thread_id found")
+            raise Exception("No thread_id found")
+        
+        # 전체 프레임 리스트 가져오기
+        frames_list = py_db.suspended_frames_manager.get_frames_list(thread_id)
+        if not frames_list:
+            print(f"[FILTERED-DEBUG] ❌ No frames list found")
+            raise Exception("No frames list found")
+        
+        print(f"[FILTERED-DEBUG] Found {len(frames_list)} total frames, filtering for user files...")
+        
+        # 🔥 개선된 is_user_code_file()로 사용자 파일만 필터링하여 수집
+        user_callstack = []
+        
+        for frame_index, frame_data in enumerate(frames_list):
             try:
-                children = variable.get_children_variables(fmt=fmt, scope=scope)
-                print(f"[LAMBDA-DEBUG] Got {len(children)} variables for frame {variables_reference} scope '{scope_type}'")
+                # 🔍 프레임 데이터 구조 디버깅
+                print(f"[FILTERED-DEBUG] Frame {frame_index} type: {type(frame_data)}, data: {frame_data}")
                 
-                # 변수 처리 (VSCode용은 필터링 없음, JSON용만 필터링)
-                for i in range(len(children)):
-                    try:
-                        child_var = children[i]
-                        var_data = child_var.get_var_data(fmt=fmt)
-                        
-                        # VSCode DAP 응답용: 모든 변수 포함 (필터링 없음)
-                        variables.append(var_data)
-                            
-                    except Exception as child_processing_error:
-                        print(f"[LAMBDA-DEBUG] Error processing frame {variables_reference} {scope_type} child {i+1}: {child_processing_error}")
+                # 🚀 다양한 프레임 데이터 형식 처리
+                frame_id = None
+                frame_obj = None
+                method_name = None
+                original_filename = None
+                filename_in_utf8 = None
+                lineno = None
                 
-                print(f"[LAMBDA-DEBUG] [{scope_type.upper() if scope_type else 'UNKNOWN'}] Collected {len(variables)} variables for VSCode")
-                        
-            except Exception as children_get_error:
-                print(f"[LAMBDA-DEBUG] Error getting frame {variables_reference} {scope_type} children: {children_get_error}")
+                if hasattr(frame_data, 'f_code'):
+                    # 🚀 Python frame 객체 직접 처리 (최우선)
+                    print(f"[FILTERED-DEBUG] Frame {frame_index} is Python frame object")
+                    frame_id = id(frame_data)  # frame 객체의 id를 frame_id로 사용
+                    frame_obj = frame_data
+                    method_name = frame_data.f_code.co_name
+                    filename_in_utf8 = frame_data.f_code.co_filename
+                    original_filename = filename_in_utf8
+                    lineno = frame_data.f_lineno
                     
-    except Exception as main_error:
-        # 에러 처리
-        print(f"[LAMBDA-DEBUG] Main exception for frame {variables_reference} {scope_type}: {type(main_error).__name__}: {main_error}")
-        
-        try:
-            import sys
-            import traceback
-            exc, exc_type, tb = sys.exc_info()
-            err = "".join(traceback.format_exception(exc, exc_type, tb))
-            variables = [{"name": "<error>", "value": err, "type": "<error>", "variablesReference": 0}]
-        except:
-            err = "<Internal error - unable to get traceback when getting variables>"
-            variables = []
-
-    # 재귀적 자식 변수 탐색 (JSON 저장용만 필터링 적용)
-    variables_with_recursive_children = []
-    try:
-        print(f"[LAMBDA-DEBUG] Starting recursive collection for JSON storage (filtering applied)...")
-        
-        for i, var_data in enumerate(variables):
-            try:
-                # JSON 저장용: 필터링 적용하여 재귀 수집
-                var_name = var_data.get("name", "")
-                var_type = var_data.get("type", "")
-                var_value = str(var_data.get("value", ""))
-                
-                # 최상위 변수도 JSON용으로는 필터링
-                if should_filter_special_variable(var_name, var_type, var_value):
-                    print(f"[JSON-FILTER] Skipped top-level: {var_name} ({var_type})")
+                elif isinstance(frame_data, (tuple, list)):
+                    frame_data_len = len(frame_data)
+                    print(f"[FILTERED-DEBUG] Frame {frame_index} length: {frame_data_len}")
+                    
+                    if frame_data_len >= 6:
+                        # 표준 형식: (frame_id, frame_obj, method_name, original_filename, filename_in_utf8, lineno, ...)
+                        frame_id, frame_obj, method_name, original_filename, filename_in_utf8, lineno = frame_data[:6]
+                    elif frame_data_len >= 4:
+                        # 축약 형식: (frame_id, frame_obj, method_name, filename)
+                        frame_id, frame_obj, method_name, filename_in_utf8 = frame_data[:4]
+                        original_filename = filename_in_utf8
+                        lineno = getattr(frame_obj, 'f_lineno', -1) if frame_obj else -1
+                    elif frame_data_len >= 3:
+                        # 최소 형식: (frame_id, frame_obj, method_name)
+                        frame_id, frame_obj, method_name = frame_data[:3]
+                        if frame_obj and hasattr(frame_obj, 'f_code'):
+                            filename_in_utf8 = frame_obj.f_code.co_filename
+                            original_filename = filename_in_utf8
+                            lineno = frame_obj.f_lineno
+                        else:
+                            filename_in_utf8 = "unknown.py"
+                            original_filename = filename_in_utf8
+                            lineno = -1
+                    else:
+                        print(f"[FILTERED-DEBUG] ⚠️ Frame {frame_index}: insufficient data length ({frame_data_len})")
+                        continue
+                        
+                elif hasattr(frame_data, '__dict__'):
+                    # 객체 형식
+                    print(f"[FILTERED-DEBUG] Frame {frame_index} object attributes: {dir(frame_data)}")
+                    frame_id = getattr(frame_data, 'frame_id', frame_index)
+                    frame_obj = getattr(frame_data, 'frame', None)
+                    method_name = getattr(frame_data, 'name', 'unknown')
+                    filename_in_utf8 = getattr(frame_data, 'filename', None)
+                    original_filename = filename_in_utf8
+                    lineno = getattr(frame_data, 'lineno', -1)
+                else:
+                    print(f"[FILTERED-DEBUG] ⚠️ Frame {frame_index}: unknown data format")
                     continue
                 
-                # 각 변수에 대해 재귀적으로 자식들 수집 (필터링 적용)
-                enhanced_var_data = collect_recursive_children(py_db, var_data)
+                # 기본값 설정
+                if not method_name:
+                    method_name = "unknown_function"
+                if not filename_in_utf8:
+                    filename_in_utf8 = "unknown.py"
+                if not original_filename:
+                    original_filename = filename_in_utf8
+                if lineno is None:
+                    lineno = -1
                 
-                print(f"[LAMBDA-DEBUG] JSON Variable {len(variables_with_recursive_children)+1}: {var_name} (filtered & processed)")
+                print(f"[FILTERED-DEBUG] Frame {frame_index} parsed: {method_name} in {os.path.basename(filename_in_utf8)}:{lineno}")
                 
-                variables_with_recursive_children.append(enhanced_var_data)
+                # 🚀 개선된 사용자 파일 필터링
+                target_filename = filename_in_utf8 or original_filename
+                if not is_user_code_file(target_filename):
+                    continue
                 
-            except Exception as recursive_error:
-                print(f"[LAMBDA-DEBUG] Error processing JSON variable {i+1}: {recursive_error}")
-                # JSON용은 에러 발생해도 스킵
+                print(f"[FILTERED-DEBUG] ✅ Processing user frame {len(user_callstack)}: {method_name} at {os.path.basename(target_filename)}:{lineno}")
+                
+                # 각 프레임의 locals와 globals 강제 수집
+                frame_locals = []
+                frame_globals = []
+                
+                try:
+                    from _pydevd_bundle.pydevd_utils import ScopeRequest
+                    
+                    # locals 수집
+                    locals_scope = ScopeRequest(frame_id, "locals")
+                    variable = py_db.suspended_frames_manager.get_variable(frame_id)
+                    if variable:
+                        locals_children = variable.get_children_variables(fmt=fmt, scope=locals_scope)
+                        for child_var in locals_children:
+                            try:
+                                var_data = child_var.get_var_data(fmt=fmt)
+                                var_name = var_data.get("name", "")
+                                var_type = var_data.get("type", "")
+                                var_value = str(var_data.get("value", ""))
+                                
+                                # 필터링 적용
+                                if should_filter_special_variable(var_name, var_type, var_value):
+                                    continue
+                                
+                                # 재귀적 수집
+                                enhanced_var_data = collect_recursive_children(py_db, var_data)
+                                frame_locals.append(enhanced_var_data)
+                                
+                            except Exception as var_error:
+                                print(f"[SCOPE-COLLECT] Error processing locals variable: {var_error}")
+                                continue
+                    
+                    # globals 수집
+                    globals_scope = ScopeRequest(frame_id, "globals")
+                    if variable:
+                        globals_children = variable.get_children_variables(fmt=fmt, scope=globals_scope)
+                        for child_var in globals_children:
+                            try:
+                                var_data = child_var.get_var_data(fmt=fmt)
+                                var_name = var_data.get("name", "")
+                                var_type = var_data.get("type", "")
+                                var_value = str(var_data.get("value", ""))
+                                
+                                # 필터링 적용
+                                if should_filter_special_variable(var_name, var_type, var_value):
+                                    continue
+                                
+                                # 재귀적 수집
+                                enhanced_var_data = collect_recursive_children(py_db, var_data)
+                                frame_globals.append(enhanced_var_data)
+                                
+                            except Exception as var_error:
+                                print(f"[SCOPE-COLLECT] Error processing globals variable: {var_error}")
+                                continue
+                        
+                except Exception as scope_error:
+                    print(f"[SCOPE-COLLECT] ❌ Error collecting variables for frame {frame_id}: {scope_error}")
+                
+                # 코드 라인 가져오기
+                code = ""
+                try:
+                    import linecache
+                    line_text = linecache.getline(target_filename, lineno)
+                    if line_text:
+                        code = line_text.strip()
+                    else:
+                        code = f"# {method_name} (line {lineno})"
+                except Exception:
+                    code = f"# {method_name}"
+                
+                # 프레임 정보 구성
+                frame_info = {
+                    "frame_id": frame_id,
+                    "file": os.path.basename(target_filename) if target_filename else "unknown",
+                    "full_file": target_filename,
+                    "line": lineno,
+                    "function": method_name,
+                    "code": code,
+                    "variables": {
+                        "locals": frame_locals,
+                        "globals": frame_globals
+                    },
+                    "counts": {
+                        "total_locals": len(frame_locals),
+                        "total_globals": len(frame_globals),
+                        "total_variables": len(frame_locals) + len(frame_globals)
+                    },
+                    "user_frame_index": len(user_callstack),  # 사용자 프레임 내에서의 인덱스
+                    "original_frame_index": frame_index,      # 전체 스택에서의 원본 인덱스
+                    "is_current_frame": (frame_id == variables_reference),
+                    "is_user_code": True
+                }
+                
+                user_callstack.append(frame_info)
+                
+                print(f"[FILTERED-DEBUG] ✅ User frame {len(user_callstack)-1} ({method_name}): L:{len(frame_locals)} G:{len(frame_globals)}")
+                
+            except Exception as frame_error:
+                print(f"[FILTERED-DEBUG] ❌ Error processing frame {frame_index}: {frame_error}")
+                import traceback
+                print(f"[FILTERED-DEBUG] ❌ Frame error traceback: {traceback.format_exc()}")
+                continue
         
-        print(f"[LAMBDA-DEBUG] Completed JSON collection: {len(variables_with_recursive_children)} variables (filtered from {len(variables)} total)")
+        print(f"[FILTERED-DEBUG] ✅ Collected filtered callstack: {len(user_callstack)} user frames (from {len(frames_list)} total)")
         
-    except Exception as recursive_main_error:
-        print(f"[LAMBDA-DEBUG] Main recursive collection error: {recursive_main_error}")
-        # 재귀 수집 실패해도 기존 변수들은 fallback으로 저장
-        variables_with_recursive_children = [
-            {**var_data, "recursive_children": [], "recursive_error": "Collection failed"}
-            for var_data in variables
-        ]
+        # 🔥 호출 순서대로 정렬 (역순으로 변경)
+        user_callstack.reverse()
+        
+        # 인덱스 재조정 (호출 순서 기준)
+        for i, frame in enumerate(user_callstack):
+            frame["user_frame_index"] = i
+            frame["is_current_frame"] = (i == len(user_callstack) - 1)  # 마지막이 현재 프레임
+        
+        print(f"[FILTERED-DEBUG] ✅ Reordered callstack (call order): {len(user_callstack)} frames")
+        
+    except Exception as main_collection_error:
+        print(f"[FILTERED-DEBUG] ❌ Main collection error: {main_collection_error}")
+        user_callstack = []
 
-    # 프레임별 정확한 콜스택 정보 추출
+    # JSON 파일 저장 및 전송
     try:
-        thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
-        frame_info = extract_frame_info_improved(py_db, thread_id, variables_reference)
+        save_dir = "/tmp"
+        session_filename = f"{save_dir}/filtered_callstack_variables_{thread_id}.json"
         
-        print(f"[LAMBDA-DEBUG] Frame info: {frame_info}")
-        
-    except Exception as frame_info_error:
-        print(f"[LAMBDA-DEBUG] Error extracting frame info: {frame_info_error}")
-        frame_info = {
-            "frame_id": variables_reference,
-            "file": "unknown",
-            "line": -1,
-            "function": "unknown",
-            "code": "# Frame info extraction failed"
-        }
-
-    # ✅ frame_id 기반 callstack 관리 (하나의 JSON 파일에 모든 프레임)
-    try:
-        save_dir = "/tmp"  # 람다 전용
-        thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
-        
-        # 🔥 thread_id만으로 파일명 생성 (frame_id 제거)
-        session_filename = f"{save_dir}/unified_callstack_variables_{thread_id}.json"
-        
-        # 기존 파일이 있으면 읽기, 없으면 새로 생성
-        if os.path.exists(session_filename):
-            try:
-                with open(session_filename, "r", encoding="utf-8") as f:
-                    session_data = json.load(f)
-                print(f"[LAMBDA-DEBUG] 📁 Loading existing callstack file for frame {variables_reference}")
-            except Exception as read_error:
-                print(f"[LAMBDA-DEBUG] Failed to read existing file: {read_error}")
-                session_data = create_empty_session_data(thread_id)
-        else:
-            print(f"[LAMBDA-DEBUG] 🆕 Creating new callstack file for thread {thread_id}")
-            session_data = create_empty_session_data(thread_id)
-
-        # callstacks 배열에서 frame_id로 기존 프레임 찾기
-        target_frame = None
-        for frame in session_data["callstacks"]:
-            if frame["frame_id"] == variables_reference:
-                target_frame = frame
-                print(f"[LAMBDA-DEBUG] 🔄 Found existing frame {variables_reference} at index {session_data['callstacks'].index(frame)}")
-                break
-        
-        # 프레임이 없으면 새로 생성
-        if target_frame is None:
-            target_frame = {
+        # 세션 데이터 구성
+        session_data = {
+            "timestamp": datetime.now().isoformat(),
+            "thread_id": thread_id,
+            "extraction_method": "improved_filtered_user_files_only",
+            "current_request": {
                 "frame_id": variables_reference,
-                "file": frame_info.get("file", "unknown"),
-                "line": frame_info.get("line", -1),
-                "function": frame_info.get("function", "unknown"),
-                "code": frame_info.get("code", "# Code not available"),
-                "variables": {
-                    "locals": [],
-                    "globals": []
-                },
-                "counts": {
-                    "total_locals": 0,
-                    "total_globals": 0,
-                    "total_variables": 0
-                },
-                "recursive_stats": {}
-            }
-            session_data["callstacks"].append(target_frame)
-            print(f"[LAMBDA-DEBUG] ➕ Added new frame {variables_reference} at index {len(session_data['callstacks'])-1}")
-        
-        # scope_type에 따라 데이터 추가/업데이트
-        if scope_type == "locals":
-            target_frame["variables"]["locals"] = variables_with_recursive_children
-            print(f"[LAMBDA-DEBUG] 📥 Added LOCALS to frame {variables_reference}: {len(variables_with_recursive_children)} variables")
-        elif scope_type == "globals":
-            target_frame["variables"]["globals"] = variables_with_recursive_children
-            print(f"[LAMBDA-DEBUG] 📥 Added GLOBALS to frame {variables_reference}: {len(variables_with_recursive_children)} variables")
-        else:
-            target_frame["variables"]["unknown_scope"] = variables_with_recursive_children
-            print(f"[LAMBDA-DEBUG] 📥 Added UNKNOWN_SCOPE to frame {variables_reference}: {len(variables_with_recursive_children)} variables")
-        
-        # 프레임 메타데이터 최신화
-        target_frame["file"] = frame_info.get("file", "unknown")
-        target_frame["line"] = frame_info.get("line", -1)
-        target_frame["function"] = frame_info.get("function", "unknown")
-        target_frame["code"] = frame_info.get("code", "# Code not available")
-        
-        # 카운트 및 통계 재계산
-        target_frame["counts"] = {
-            "total_locals": len(target_frame["variables"]["locals"]),
-            "total_globals": len(target_frame["variables"]["globals"]),
-            "total_variables": len(target_frame["variables"]["locals"]) + len(target_frame["variables"]["globals"])
+                "scope_type": scope_type
+            },
+            "callstacks": user_callstack  # 개선된 필터링으로 수집된 사용자 파일의 프레임만
         }
         
-        target_frame["recursive_stats"][scope_type or "unknown"] = calculate_recursive_stats(variables_with_recursive_children)
-        
-        # 전체 세션 메타데이터 업데이트
-        total_frames = len(session_data["callstacks"])
-        total_variables = sum(frame["counts"]["total_variables"] for frame in session_data["callstacks"])
-        frames_with_both_scopes = len([f for f in session_data["callstacks"] 
-                                     if len(f["variables"]["locals"]) > 0 and len(f["variables"]["globals"]) > 0])
-        
-        session_data["last_updated"] = datetime.now().isoformat()
-        session_data["last_updated_scope"] = scope_type
-        session_data["last_updated_frame"] = variables_reference
-        session_data["summary"] = {
-            "total_frames": total_frames,
-            "total_variables": total_variables,
-            "frames_with_both_scopes": frames_with_both_scopes,
-            "callstack_complete": frames_with_both_scopes > 0  # 적어도 하나의 프레임에 locals+globals가 있으면
-        }
-        
-        # 파일 덮어쓰기 저장
+        # 파일 저장
         with open(session_filename, "w", encoding="utf-8") as f:
             json.dump(session_data, f, indent=2, ensure_ascii=False)
 
-        print(f"[LAMBDA-DEBUG] 💾 Callstack file updated: {session_filename}")
-        print(f"[LAMBDA-DEBUG] 📊 Current callstack state:")
-        for i, frame in enumerate(session_data["callstacks"]):
-            locals_count = len(frame["variables"]["locals"])
-            globals_count = len(frame["variables"]["globals"])
-            complete = "✅" if locals_count > 0 and globals_count > 0 else "❌"
-            file_info = f"{frame['file']}:{frame['line']}"
-            code_preview = frame['code'][:50] + "..." if len(frame['code']) > 50 else frame['code']
-            print(f"  [{i}] Frame {frame['frame_id']}: {frame['function']} | {file_info}")
-            print(f"      Code: {code_preview}")
-            print(f"      Variables: L:{locals_count} G:{globals_count} {complete}")
-            print()  # 빈 줄로 구분
-
-        # 🚀 현재 프레임이 완전해졌을 때 전송
-        current_frame_complete = (len(target_frame["variables"]["locals"]) > 0 and 
-                                len(target_frame["variables"]["globals"]) > 0)
+        print(f"[FILTERED-DEBUG] 💾 Filtered callstack saved: {session_filename}")
         
-        if scope_type == "globals" and current_frame_complete:
-            print(f"[LAMBDA-DEBUG] 🚀 Frame {variables_reference} complete! Sending callstack file...")
-            success = send_file_to_local(session_filename)
-            if success:
-                print(f"[LAMBDA-DEBUG] ✅ Callstack file sent successfully!")
-                # 전송 후에는 파일 유지 (다른 프레임이 추가될 수 있음)
-            else:
-                print(f"[LAMBDA-DEBUG] ❌ Callstack file send failed!")
+        # 파일 저장 확인
+        if os.path.exists(session_filename):
+            file_size = os.path.getsize(session_filename)
+            print(f"[FILTERED-DEBUG] 📁 File confirmed: {file_size} bytes")
         else:
-            print(f"[LAMBDA-DEBUG] ⏳ Frame {variables_reference} waiting for complete data... (current: {scope_type})")
+            print(f"[FILTERED-DEBUG] ❌ File save failed!")
+            return
+        
+        # 사용자 콜스택 요약 출력
+        print(f"[FILTERED-DEBUG] 📊 User callstack summary:")
+        for i, frame in enumerate(user_callstack):
+            marker = "🔴" if frame["is_current_frame"] else "⚪"
+            locals_count = frame["counts"]["total_locals"]
+            globals_count = frame["counts"]["total_globals"]
+            print(f"  {marker} [{i}] {frame['function']} | {frame['file']}:{frame['line']} | L:{locals_count} G:{globals_count}")
+
+        # 🚀 사용자 프레임이 있으면 전송
+        if user_callstack:
+            print(f"[FILTERED-DEBUG] 🚀 User callstack ready! Sending to developer PC...")
+            print(f"[FILTERED-DEBUG] 📤 Calling send_file_to_local({session_filename})")
+            
+            try:
+                success = send_file_to_local(session_filename)
+                print(f"[FILTERED-DEBUG] 📤 send_file_to_local returned: {success}")
+                
+                if success:
+                    print(f"[FILTERED-DEBUG] ✅ Filtered callstack sent successfully!")
+                else:
+                    print(f"[FILTERED-DEBUG] ❌ Filtered callstack send failed!")
+                    
+            except Exception as send_error:
+                print(f"[FILTERED-DEBUG] ❌ send_file_to_local exception: {send_error}")
+                import traceback
+                print(f"[FILTERED-DEBUG] ❌ Send traceback: {traceback.format_exc()}")
+        else:
+            print(f"[FILTERED-DEBUG] ⚠️ No user frames collected, skipping transmission")
 
     except Exception as e:
-        print(f"[LAMBDA-DEBUG] Failed to save/transfer callstack session: {e}")
+        print(f"[FILTERED-DEBUG] Failed to save/transfer filtered callstack: {e}")
         import traceback
-        print(f"[LAMBDA-DEBUG] Traceback: {traceback.format_exc()}")
+        print(f"[FILTERED-DEBUG] Traceback: {traceback.format_exc()}")
 
-    except Exception as e:
-        print(f"[LAMBDA-DEBUG] Failed to save/transfer unified session: {e}")
-        import traceback
-        print(f"[LAMBDA-DEBUG] Traceback: {traceback.format_exc()}")
+    print(f"[FILTERED-DEBUG] Filtered callstack collection finished")
 
-    print(f"[LAMBDA-DEBUG] Callstack session completed for frame {variables_reference} {scope_type}")
-
-    # DAP 응답 생성 (완전히 동일하게 유지)
+    # DAP 응답 생성 (VS Code에게는 요청된 scope만 반환)
     from _pydevd_bundle._debug_adapter.pydevd_schema import VariablesResponseBody
     from _pydevd_bundle._debug_adapter import pydevd_base_schema
     from _pydevd_bundle.pydevd_net_command import NetCommand
     from _pydevd_bundle.pydevd_comm_constants import CMD_RETURN
     
-    body = VariablesResponseBody(variables)  # 기존 variables 사용 (재귀 정보 없는)
+    body = VariablesResponseBody(variables_for_vscode)
     variables_response = pydevd_base_schema.build_response(request, kwargs={"body": body})
     py_db.writer.add_command(NetCommand(CMD_RETURN, 0, variables_response, is_json=True))
+
+def is_user_code_file(filename):
+    """
+    🔥 개선된 사용자 코드 파일 판별 (더 정확한 필터링)
+    """
+    if not filename:
+        return False
+    
+    # 파일명 정규화
+    filename_lower = filename.lower()
+    basename = os.path.basename(filename)
+    
+    # 🚀 사용자 코드 패턴들 (우선순위 - 이게 있으면 무조건 사용자 코드)
+    user_patterns = [
+        '/var/task/',          # AWS Lambda 사용자 코드
+        '/app/',               # Docker 앱 경로
+        '/workspace/',         # 개발 워크스페이스
+        '/src/',               # 소스 코드 디렉토리
+        '/code/',              # 코드 디렉토리
+        '/home/',              # 홈 디렉토리
+        '/Users/',             # macOS 사용자 디렉토리
+        'lambda_function.py',  # 람다 함수 파일
+        'main.py',             # 메인 파일
+        'app.py',              # 앱 파일
+    ]
+    
+    # 명시적 사용자 패턴 확인
+    for pattern in user_patterns:
+        if pattern in filename:
+            print(f"[USER-FILTER] ✅ User file (pattern match): {basename}")
+            return True
+    
+    # 🚫 시스템/런타임 파일 패턴들 (이게 있으면 무조건 시스템 파일)
+    system_patterns = [
+        # Python 런타임 및 표준 라이브러리
+        '/usr/lib/python',
+        '/usr/local/lib/python',
+        'site-packages',
+        'dist-packages',
+        
+        # 디버거 관련
+        'pydevd',
+        'debugpy',
+        '_pydev',
+        
+        # AWS Lambda 런타임
+        '/var/runtime/',
+        '/opt/python/',
+        
+        # 임시/내부 파일들
+        '<string>',
+        '<stdin>',
+        '<console>',
+        '<frozen',
+        
+        # 기타 시스템 경로들
+        '/lib/python',
+        '/Library/Frameworks/Python',
+        'importlib',
+        'runpy.py',
+        'threading.py',
+        'queue.py',
+        'bootstrap',
+        'runtime',
+    ]
+    
+    # 시스템 패턴 확인
+    for pattern in system_patterns:
+        if pattern in filename_lower:
+            print(f"[USER-FILTER] 🚫 System file: {basename}")
+            return False
+    
+    # 🔍 .py 확장자 파일은 기본적으로 사용자 파일로 간주
+    if filename.endswith('.py'):
+        # 단, 파일명이 시스템적인 경우는 제외
+        system_filenames = [
+            '__init__.py',
+            'setup.py',
+            'conftest.py',
+            'test_',
+            '_test',
+            'tests.py'
+        ]
+        
+        for sys_name in system_filenames:
+            if sys_name in basename.lower():
+                print(f"[USER-FILTER] 🚫 System-like Python file: {basename}")
+                return False
+        
+        print(f"[USER-FILTER] ✅ User Python file: {basename}")
+        return True
+    
+    # 🚫 기타는 시스템 파일로 간주
+    print(f"[USER-FILTER] 🚫 Non-Python file: {basename}")
+    return False
 
 def create_empty_session_data(thread_id):
     """빈 callstack 세션 데이터 구조 생성"""
@@ -1970,7 +2128,7 @@ def create_empty_session_data(thread_id):
     }
 
 def extract_frame_info_improved(py_db, thread_id, variables_reference):
-    """프레임 정보 추출 (람다 환경 최적화)"""
+    """프레임 정보 추출 (람다 환경 최적화) - 객체 변경 시 라인 정보 보강"""
     try:
         print(f"[LAMBDA-DEBUG] Extracting frame info for {variables_reference}")
         
@@ -1982,7 +2140,6 @@ def extract_frame_info_improved(py_db, thread_id, variables_reference):
                 lineno = frame.f_lineno
                 function_name = frame.f_code.co_name
                 
-                # 코드 확인
                 try:
                     import linecache
                     line_text = linecache.getline(filename, lineno)
@@ -1990,25 +2147,44 @@ def extract_frame_info_improved(py_db, thread_id, variables_reference):
                 except Exception:
                     code = "# Code extraction failed"
                 
+                print(f"[LAMBDA-DEBUG] ✅ Method 1 success: {filename}:{lineno}")
                 return {
                     "frame_id": variables_reference,
                     "file": os.path.basename(filename),
                     "full_file": filename,
                     "line": lineno,
                     "function": function_name,
-                    "code": code
+                    "code": code,
+                    "extraction_method": "find_frame"
                 }
         except Exception as e:
             print(f"[LAMBDA-DEBUG] find_frame failed: {e}")
         
-        # 방법 2: frames_list 직접 접근
+        # 방법 2: frames_list 직접 접근 (🔧 FramesList 객체 처리 개선)
         try:
             actual_thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
             if actual_thread_id and hasattr(py_db.suspended_frames_manager, 'get_frames_list'):
                 frames_list = py_db.suspended_frames_manager.get_frames_list(actual_thread_id)
                 
                 if frames_list:
-                    for frame_data in frames_list[:3]:  # 처음 3개만
+                    print(f"[LAMBDA-DEBUG] frames_list type: {type(frames_list)}")
+                    
+                    # 🔧 FramesList 객체 처리 개선
+                    frames_to_check = []
+                    if hasattr(frames_list, '__iter__'):
+                        # 반복 가능한 객체인 경우
+                        try:
+                            frames_to_check = list(frames_list)[:3]
+                        except Exception:
+                            # 리스트 변환 실패 시 직접 반복
+                            count = 0
+                            for frame_data in frames_list:
+                                frames_to_check.append(frame_data)
+                                count += 1
+                                if count >= 3:
+                                    break
+                    
+                    for frame_data in frames_to_check:
                         try:
                             if isinstance(frame_data, (tuple, list)) and len(frame_data) >= 6:
                                 f_id, frame_obj, method_name, original_filename, filename_in_utf8, lineno = frame_data[:6]
@@ -2028,37 +2204,323 @@ def extract_frame_info_improved(py_db, thread_id, variables_reference):
                                     line_text = linecache.getline(current_filename, current_lineno)
                                     code = line_text.strip() if line_text else "# Code not available"
                                     
+                                    print(f"[LAMBDA-DEBUG] ✅ Method 2 success: {current_filename}:{current_lineno}")
                                     return {
                                         "frame_id": variables_reference,
                                         "file": os.path.basename(current_filename),
                                         "full_file": current_filename,
                                         "line": current_lineno,
                                         "function": current_function,
-                                        "code": code
+                                        "code": code,
+                                        "extraction_method": "frames_list"
                                     }
                         except Exception:
                             continue
         except Exception as e:
             print(f"[LAMBDA-DEBUG] frames_list failed: {e}")
         
-        # 기본 반환값
+        # 🚀 방법 2.5: 객체 변수의 경우 부모 프레임 정보 활용
+        try:
+            if is_object_variable(py_db, variables_reference, thread_id):
+                print(f"[LAMBDA-DEBUG] Attempting method 2.5: parent frame lookup...")
+                
+                # 부모 프레임 정보 찾기
+                parent_frame_info = None
+                try:
+                    # 같은 스레드의 다른 프레임들 확인
+                    actual_thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+                    if actual_thread_id:
+                        # 최근에 성공한 프레임 정보 재사용
+                        frames_list = py_db.suspended_frames_manager.get_frames_list(actual_thread_id)
+                        if frames_list:
+                            frames_to_check = []
+                            if hasattr(frames_list, '__iter__'):
+                                try:
+                                    frames_to_check = list(frames_list)
+                                except Exception:
+                                    count = 0
+                                    for frame_data in frames_list:
+                                        frames_to_check.append(frame_data)
+                                        count += 1
+                                        if count >= 5:  # 더 많은 프레임 확인
+                                            break
+                            
+                            for frame_data in frames_to_check:
+                                try:
+                                    if isinstance(frame_data, (tuple, list)) and len(frame_data) >= 6:
+                                        f_id, frame_obj, method_name, original_filename, filename_in_utf8, lineno = frame_data[:6]
+                                        
+                                        # 유효한 프레임 정보가 있는 경우
+                                        if (hasattr(frame_obj, 'f_lineno') and 
+                                            original_filename and 
+                                            original_filename.endswith('.py') and
+                                            not any(pattern in original_filename.lower() for pattern in 
+                                                   ['pydevd', 'debugpy', '_pydev', 'site-packages'])):
+                                            
+                                            parent_frame_info = {
+                                                "filename": frame_obj.f_code.co_filename,
+                                                "lineno": frame_obj.f_lineno,
+                                                "function": frame_obj.f_code.co_name
+                                            }
+                                            break
+                                except Exception:
+                                    continue
+                except Exception:
+                    pass
+                
+                if parent_frame_info:
+                    import linecache
+                    line_text = linecache.getline(parent_frame_info["filename"], parent_frame_info["lineno"])
+                    code = line_text.strip() if line_text else "# Code not available"
+                    
+                    print(f"[LAMBDA-DEBUG] ✅ Method 2.5 success: {parent_frame_info['filename']}:{parent_frame_info['lineno']}")
+                    return {
+                        "frame_id": variables_reference,
+                        "file": os.path.basename(parent_frame_info["filename"]),
+                        "full_file": parent_frame_info["filename"],
+                        "line": parent_frame_info["lineno"],
+                        "function": parent_frame_info["function"],
+                        "code": code,
+                        "extraction_method": "parent_frame_lookup"
+                    }
+            else:
+                print(f"[LAMBDA-DEBUG] Not an object variable, skipping parent frame lookup")
+        except Exception as e:
+            print(f"[LAMBDA-DEBUG] Method 2.5 failed: {e}")
+        
+        # 🚀 방법 3: 현재 실행 중인 스레드의 frame 추적
+        try:
+            print(f"[LAMBDA-DEBUG] Attempting method 3: current thread frame tracking...")
+            
+            # 현재 실행 중인 모든 프레임 탐색
+            import sys
+            import threading
+            
+            current_tid = threading.current_thread().ident
+            current_frames = sys._current_frames()
+            
+            # 현재 스레드의 프레임 스택 순회
+            frame = current_frames.get(current_tid)
+            frame_depth = 0
+            
+            while frame and frame_depth < 10:  # 최대 10개 프레임까지 탐색
+                try:
+                    filename = frame.f_code.co_filename
+                    lineno = frame.f_lineno
+                    function_name = frame.f_code.co_name
+                    
+                    # 사용자 코드 필터링 (디버거 코드 제외)
+                    if not any(pattern in filename.lower() for pattern in 
+                              ['pydevd', 'debugpy', '_pydev', 'site-packages']):
+                        
+                        # .py 파일이고 유효한 라인 번호를 가진 경우
+                        if filename.endswith('.py') and lineno > 0:
+                            
+                            import linecache
+                            line_text = linecache.getline(filename, lineno)
+                            code = line_text.strip() if line_text else "# Code not available"
+                            
+                            print(f"[LAMBDA-DEBUG] ✅ Method 3 success! Found user frame:")
+                            print(f"[LAMBDA-DEBUG]   File: {filename}")
+                            print(f"[LAMBDA-DEBUG]   Line: {lineno}")
+                            print(f"[LAMBDA-DEBUG]   Function: {function_name}")
+                            print(f"[LAMBDA-DEBUG]   Code: {code[:50]}...")
+                            
+                            return {
+                                "frame_id": variables_reference,
+                                "file": os.path.basename(filename),
+                                "full_file": filename,
+                                "line": lineno,
+                                "function": function_name,
+                                "code": code,
+                                "extraction_method": "current_thread_frame_tracking"
+                            }
+                    
+                    frame = frame.f_back
+                    frame_depth += 1
+                    
+                except Exception as frame_error:
+                    print(f"[LAMBDA-DEBUG] Frame processing error: {frame_error}")
+                    frame = frame.f_back
+                    frame_depth += 1
+                    continue
+            
+            print(f"[LAMBDA-DEBUG] Method 3: No valid user frame found in {frame_depth} frames")
+            
+        except Exception as e:
+            print(f"[LAMBDA-DEBUG] Method 3 failed: {e}")
+        
+        # 🚀 방법 4: traceback 기반 정보 추출 (최후 수단)
+        try:
+            print(f"[LAMBDA-DEBUG] Attempting method 4: traceback-based extraction...")
+            
+            import traceback
+            import threading
+            
+            current_tid = threading.current_thread().ident
+            current_frames = sys._current_frames()
+            frame = current_frames.get(current_tid)
+            
+            if frame:
+                # traceback.format_stack으로 스택 정보 추출
+                stack = traceback.format_stack(frame)
+                
+                # 스택에서 사용자 코드 찾기
+                for entry in reversed(stack[-5:]):  # 최근 5개 엔트리만 확인
+                    try:
+                        lines = entry.strip().split('\n')
+                        if len(lines) >= 2:
+                            location_line = lines[0].strip()
+                            code_line = lines[1].strip()
+                            
+                            # 파일 정보 파싱
+                            if '"' in location_line and 'line ' in location_line:
+                                parts = location_line.split(', ')
+                                if len(parts) >= 3:
+                                    # 파일 경로 추출
+                                    file_part = parts[0].strip()
+                                    if '"' in file_part:
+                                        filename = file_part.split('"')[1]
+                                        
+                                        # 사용자 코드 필터링
+                                        if (filename.endswith('.py') and 
+                                            not any(pattern in filename.lower() for pattern in 
+                                                   ['pydevd', 'debugpy', '_pydev', 'site-packages'])):
+                                            
+                                            # 라인 번호 추출
+                                            line_part = parts[1].strip()
+                                            if 'line ' in line_part:
+                                                try:
+                                                    lineno = int(line_part.replace('line ', ''))
+                                                except ValueError:
+                                                    continue
+                                            
+                                            # 함수명 추출
+                                            func_part = parts[2].strip()
+                                            if 'in ' in func_part:
+                                                function_name = func_part.replace('in ', '')
+                                            else:
+                                                function_name = "unknown"
+                                            
+                                            print(f"[LAMBDA-DEBUG] ✅ Method 4 success! Found from traceback:")
+                                            print(f"[LAMBDA-DEBUG]   File: {filename}")
+                                            print(f"[LAMBDA-DEBUG]   Line: {lineno}")
+                                            print(f"[LAMBDA-DEBUG]   Function: {function_name}")
+                                            print(f"[LAMBDA-DEBUG]   Code: {code_line}")
+                                            
+                                            return {
+                                                "frame_id": variables_reference,
+                                                "file": os.path.basename(filename),
+                                                "full_file": filename,
+                                                "line": lineno,
+                                                "function": function_name,
+                                                "code": code_line,
+                                                "extraction_method": "traceback_based"
+                                            }
+                    except Exception as parse_error:
+                        print(f"[LAMBDA-DEBUG] Traceback parsing error: {parse_error}")
+                        continue
+            
+            print(f"[LAMBDA-DEBUG] Method 4: No valid traceback entry found")
+            
+        except Exception as e:
+            print(f"[LAMBDA-DEBUG] Method 4 failed: {e}")
+        
+        
+        ############## 그냥 무조건 -1로
+        # 🚀 개선된 기본 반환값 (최소한 .py 확장자는 보장)
+        print(f"[LAMBDA-DEBUG] All methods failed, using enhanced fallback...")
+        
+        # 현재 실행 중인 파일 정보라도 가져오기 시도
+        fallback_file = "lambda_function.py"  # ✅ .py 확장자 추가
+        fallback_line = -1
+        fallback_function = "lambda_handler"
+        
+        try:
+            # 현재 스택에서 첫 번째 사용자 파일이라도 찾기
+            import sys
+            import threading
+            current_frames = sys._current_frames()
+            frame = current_frames.get(threading.current_thread().ident)
+            
+            while frame:
+                filename = frame.f_code.co_filename
+                if (filename.endswith('.py') and 
+                    not any(pattern in filename.lower() for pattern in 
+                           ['pydevd', 'debugpy', '_pydev', 'site-packages'])):
+                    fallback_file = os.path.basename(filename)
+                    fallback_line = -1
+                    fallback_function = frame.f_code.co_name
+                    print(f"[LAMBDA-DEBUG] Enhanced fallback found: {fallback_file}:{fallback_line}")
+                    break
+                frame = frame.f_back
+        except Exception as fallback_error:
+            print(f"[LAMBDA-DEBUG] Enhanced fallback failed: {fallback_error}")
+        
         return {
             "frame_id": variables_reference,
-            "file": "lambda_function",
-            "line": -1,
-            "function": "lambda_handler",
-            "code": "# Frame info extraction failed"
+            "file": fallback_file,  # ✅ .py 확장자 포함
+            "full_file": f"/tmp/{fallback_file}",
+            "line": fallback_line,  # ✅ jump to 가능한 라인
+            "function": fallback_function,
+            "code": "# Frame info extraction failed - using enhanced fallback",
+            "extraction_method": "enhanced_fallback"
         }
         
     except Exception as e:
         print(f"[LAMBDA-DEBUG] Critical error: {e}")
         return {
             "frame_id": variables_reference,
-            "file": "error",
-            "line": -1,
+            "file": "lambda_function.py",  # ✅ .py 확장자 보장
+            "full_file": "/tmp/lambda_function.py",
+            "line": -1,  # 
             "function": "unknown",
-            "code": f"# Critical error: {str(e)}"
+            "code": f"# Critical error: {str(e)}",
+            "extraction_method": "error_fallback"
         }
+
+    
+def is_object_variable(py_db, variables_reference, thread_id):
+    """객체 변수인지 정확히 판별하는 함수"""
+    try:
+        # 1. 기본 조건: variables_reference가 thread_id와 다름
+        if variables_reference == thread_id:
+            return False
+        
+        # 2. Variable 타입 확인
+        variable = py_db.suspended_frames_manager.get_variable(variables_reference)
+        variable_type = type(variable).__name__
+        
+        if variable_type == "_ObjectVariable":
+            return True
+        elif variable_type == "_FrameVariable":
+            return False
+        
+        # 3. Frame 추출 가능 여부로 판별
+        frame = py_db.find_frame(thread_id, variables_reference)
+        if frame is not None:
+            # frame을 직접 찾을 수 있다면 Frame variable
+            return False
+        
+        # 4. frames_list에서 frame_id로 존재하는지 확인
+        actual_thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+        if actual_thread_id:
+            frames_list = py_db.suspended_frames_manager.get_frames_list(actual_thread_id)
+            if frames_list:
+                for frame_data in frames_list:
+                    if isinstance(frame_data, (tuple, list)) and len(frame_data) >= 1:
+                        f_id = frame_data[0]
+                        if f_id == variables_reference:
+                            # frames_list에 직접 존재한다면 Frame variable
+                            return False
+        
+        # 5. 위 조건들을 통과했다면 Object variable일 가능성이 높음
+        return True
+        
+    except Exception as e:
+        print(f"[DEBUG] Error determining variable type: {e}")
+        # 에러 시 안전하게 False 반환
+        return False
 
 # def collect_recursive_children(py_db, var_data, current_depth=0, processed_refs=None, parent_type=None):
 #     """

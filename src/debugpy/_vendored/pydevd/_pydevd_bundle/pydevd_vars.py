@@ -644,8 +644,6 @@ def change_attr_expression(frame, attr, expression, dbg, value=SENTINEL_VALUE, /
 
     except Exception as e:
         pydev_log.exception(e)
-    
-
 
 MAXIMUM_ARRAY_SIZE = 100
 MAX_SLICE_SIZE = 1000

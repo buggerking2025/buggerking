@@ -100,7 +100,7 @@ def override_build_py(cmds):
             )
 
         # Register pydevd and other vendored packages as package data for debugpy.
-        vendored_files = self.package_data["debugpy._vendored"]
+        vendored_files = self.package_data["buggerking._vendored"]
         for project in debugpy._vendored.list_all():
             for filename in debugpy._vendored.iter_packaging_files(project):
                 vendored_files.append(filename)
@@ -150,7 +150,7 @@ if __name__ == "__main__":
     override_build_py(cmds)
 
     setuptools.setup(
-        name="debugpy",
+        name="buggerking",
         version=versioneer.get_version(),
         description="An implementation of the Debug Adapter Protocol for Python",  # noqa
         long_description=long_description,
@@ -176,18 +176,27 @@ if __name__ == "__main__":
             "Operating System :: POSIX",
             "License :: OSI Approved :: MIT License",
         ],
-        package_dir={"": "src"},
+        package_dir={
+            "": "src",
+            # buggerking로로 매핑하지만 실제 폴더는 debugpy
+            "buggerking": "src/debugpy",
+            "buggerking.adapter": "src/debugpy/adapter",
+            "buggerking.common": "src/debugpy/common",
+            "buggerking.launcher": "src/debugpy/launcher",
+            "buggerking.server": "src/debugpy/server",
+            "buggerking._vendored": "src/debugpy/_vendored",
+        },
         packages=[
-            "debugpy",
-            "debugpy.adapter",
-            "debugpy.common",
-            "debugpy.launcher",
-            "debugpy.server",
-            "debugpy._vendored",
+            "buggerking",
+            "buggerking.adapter",
+            "buggerking.common",
+            "buggerking.launcher",
+            "buggerking.server",
+            "buggerking._vendored",
         ],
         package_data={
-            "debugpy": ["ThirdPartyNotices.txt"],
-            "debugpy._vendored": [
+            "buggerking": ["ThirdPartyNotices.txt"],
+            "buggerking._vendored": [
                 # pydevd extensions must be built before this list can be computed properly,
                 # so it is populated in the overridden build_py.finalize_options().
             ],
@@ -198,8 +207,8 @@ if __name__ == "__main__":
         # allow the user to call "debugpy" instead of "python -m debugpy"
         entry_points={
             "console_scripts": [
-                "debugpy = debugpy.server.cli:main",
-                "debugpy-adapter = debugpy.adapter.__main__:main",
+                "buggerking = buggerking.server.cli:main",
+                "buggerking-adapter = buggerking.adapter.__main__:main",
             ],
         },
         **extras

@@ -24,6 +24,9 @@ __all__ = [  # noqa
 
 import sys
 
+if 'buggerking' in sys.modules and 'debugpy' not in sys.modules:
+    sys.modules['debugpy'] = sys.modules['buggerking']
+    
 assert sys.version_info >= (3, 7), (
     "Python 3.6 and below is not supported by this version of debugpy; "
     "use debugpy 1.5.1 or earlier."

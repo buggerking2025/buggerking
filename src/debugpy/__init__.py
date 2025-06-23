@@ -37,5 +37,8 @@ assert sys.version_info >= (3, 7), (
 # SyntaxError on Python 2 and preventing the above version check from executing.
 from debugpy.public_api import *  # noqa
 from debugpy.public_api import __version__
+from debugpy._decorators import debug_decorator
+
+__all__.append("debug_decorator")
 
 del sys

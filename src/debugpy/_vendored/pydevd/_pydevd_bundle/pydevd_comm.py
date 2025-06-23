@@ -133,6 +133,11 @@ from io import StringIO
 # CMD_XXX constants imported for backward compatibility
 from _pydevd_bundle.pydevd_comm_constants import *  # @UnusedWildImport
 
+import json
+from datetime import datetime
+import struct
+import threading
+
 # Socket import aliases:
 AF_INET, AF_INET6, SOCK_STREAM, SHUT_WR, SOL_SOCKET, IPPROTO_TCP, socket = (
     socket_module.AF_INET,
@@ -710,6 +715,22 @@ class InternalGetThreadStack(InternalThreadCommand):
             dbg.writer.add_command(self._cmd)
             self._cmd = None
 
+def extract_json_from_cmd(cmd):
+    import xml.etree.ElementTree as ET
+    result = {"stackFrames": []}
+    try:
+        root = ET.fromstring(cmd.text)
+        for frame in root.findall("frame"):
+            frame_info = {
+                "file": frame.attrib.get("file"),
+                "line": int(frame.attrib.get("line", 0)),
+                "name": frame.attrib.get("name"),
+                "obj": frame.attrib.get("obj"),
+            }
+            result["stackFrames"].append(frame_info)
+    except Exception as e:
+        result["error"] = f"Failed to parse stack XML: {str(e)}"
+    return result
 
 def internal_step_in_thread(py_db, thread_id, cmd_id, set_additional_thread_info):
     thread_to_step = pydevd_find_thread_by_id(thread_id)
@@ -772,46 +793,1984 @@ class InternalSetNextStatementThread(InternalThreadCommand):
             info.pydev_state = STATE_RUN
             info.update_stepping_info()
 
+# def log_variable(f, var, depth=0, max_depth=3, py_db=None, request=None, processed_refs=None):
+#     """
+#     실제 SuspendedFramesManager 구조에 맞춰 완전히 수정된 버전
+#     """
+#     if processed_refs is None:
+#         processed_refs = set()
+    
+#     # depth에 따른 indent (4칸씩)
+#     indent = "    " * depth
+#     var_name = var.get("name", "unknown")
+#     var_value = str(var.get("value", ""))[:150]
+#     var_type = var.get("type", "unknown")
+#     variables_reference = var.get("variablesReference", 0)
+    
+#     try:
+#         f.write(f"{indent}[DEPTH {depth}] {var_name} = {var_value} ({var_type}) [ref: {variables_reference}]\n")
+#     except UnicodeEncodeError:
+#         safe_name = var_name.encode('ascii', 'replace').decode('ascii')
+#         safe_value = var_value.encode('ascii', 'replace').decode('ascii')
+#         safe_type = var_type.encode('ascii', 'replace').decode('ascii')
+#         f.write(f"{indent}[DEPTH {depth}] {safe_name} = {safe_value} ({safe_type}) [ref: {variables_reference}]\n")
+
+#     # 재귀 종료 조건들
+#     if depth >= max_depth:
+#         f.write(f"{indent}    +-- [MAX DEPTH {max_depth} REACHED]\n")
+#         return
+        
+#     if variables_reference == 0:
+#         f.write(f"{indent}    +-- [NO CHILDREN - ref is 0]\n")
+#         return
+        
+#     if py_db is None:
+#         f.write(f"{indent}    +-- [NO py_db PROVIDED]\n")
+#         return
+        
+#     # 순환 참조 확인
+#     if variables_reference in processed_refs:
+#         f.write(f"{indent}    +-- [CIRCULAR REFERENCE - ref {variables_reference}]\n")
+#         return
+    
+#     processed_refs.add(variables_reference)
+
+#     # 올바른 방법으로 변수 접근
+#     try:
+#         sfm = py_db.suspended_frames_manager
+#         f.write(f"{indent}    +-- [ACCESSING VARIABLE {variables_reference}]\n")
+        
+#         # 1. _get_tracker_for_variable_reference를 통해 tracker 찾기
+#         try:
+#             frames_tracker = sfm._get_tracker_for_variable_reference(variables_reference)
+#             if frames_tracker is None:
+#                 f.write(f"{indent}    +-- [NO TRACKER FOUND for ref {variables_reference}]\n")
+                
+#                 # 디버깅: 사용 가능한 tracker들 확인
+#                 available_trackers = list(sfm._thread_id_to_tracker.keys())
+#                 f.write(f"{indent}    +-- [AVAILABLE TRACKERS]: {available_trackers}\n")
+                
+#                 # 각 tracker에서 변수 찾기 시도
+#                 for thread_id, tracker in sfm._thread_id_to_tracker.items():
+#                     try:
+#                         test_var = tracker.get_variable(variables_reference)
+#                         f.write(f"{indent}    +-- [FOUND in tracker {thread_id}!]\n")
+#                         frames_tracker = tracker
+#                         break
+#                     except KeyError:
+#                         continue
+#                     except Exception as tracker_error:
+#                         f.write(f"{indent}    +-- [TRACKER {thread_id} ERROR]: {tracker_error}\n")
+                
+#                 if frames_tracker is None:
+#                     f.write(f"{indent}    +-- [VARIABLE NOT FOUND IN ANY TRACKER]\n")
+#                     return
+#             else:
+#                 f.write(f"{indent}    +-- [FOUND TRACKER: {type(frames_tracker).__name__}]\n")
+            
+#             # 2. tracker에서 variable 가져오기
+#             variable = frames_tracker.get_variable(variables_reference)
+#             f.write(f"{indent}    +-- [GOT VARIABLE: {type(variable).__name__}]\n")
+            
+#             # 3. format 정보 추출
+#             fmt = {}
+#             if request and hasattr(request, 'arguments') and hasattr(request.arguments, 'format'):
+#                 fmt = request.arguments.format
+#                 if hasattr(fmt, "to_dict"):
+#                     fmt = fmt.to_dict()
+            
+#             # 4. scope 정보 처리 (필요한 경우)
+#             scope = None
+            
+#             # 5. children 가져오기
+#             try:
+#                 f.write(f"{indent}    +-- [GETTING CHILDREN...]\n")
+#                 children = variable.get_children_variables(fmt=fmt, scope=scope)
+#                 f.write(f"{indent}    +-- [FOUND {len(children)} CHILDREN]\n")
+                
+#                 if len(children) == 0:
+#                     f.write(f"{indent}    +-- [NO CHILDREN TO PROCESS]\n")
+#                 else:
+#                     # 처음 50개 children만 처리 (성능상 이유)
+#                     max_children = min(50, len(children))
+#                     for i in range(max_children):
+#                         try:
+#                             child_var = children[i]
+#                             f.write(f"{indent}    +-- [PROCESSING CHILD {i+1}/{len(children)}]\n")
+                            
+#                             child_data = child_var.get_var_data(fmt=fmt)
+                            
+#                             # 재귀 호출
+#                             log_variable(f, child_data, depth + 1, max_depth, py_db, request, processed_refs.copy())
+                            
+#                         except Exception as child_error:
+#                             f.write(f"{indent}    +-- [CHILD {i+1} ERROR]: {type(child_error).__name__}: {str(child_error)[:80]}\n")
+                    
+#                     if len(children) > max_children:
+#                         f.write(f"{indent}    +-- [... {len(children) - max_children} more children not shown]\n")
+                        
+#             except Exception as children_error:
+#                 f.write(f"{indent}    +-- [CHILDREN ERROR]: {type(children_error).__name__}: {str(children_error)[:100]}\n")
+                
+#                 # 대안: 기본 파라미터로 시도
+#                 try:
+#                     f.write(f"{indent}    +-- [TRYING BASIC CHILDREN ACCESS...]\n")
+#                     children = variable.get_children_variables()
+#                     f.write(f"{indent}    +-- [BASIC: found {len(children)} children]\n")
+                    
+#                     # 처음 3개만 테스트
+#                     for i in range(min(3, len(children))):
+#                         try:
+#                             child_var = children[i]
+#                             child_data = child_var.get_var_data()
+#                             child_name = child_data.get('name', 'unknown')
+#                             f.write(f"{indent}    +-- [BASIC CHILD {i+1}: {child_name}]\n")
+                            
+#                             # 재귀 호출 (깊이 제한)
+#                             if depth < max_depth - 1:
+#                                 log_variable(f, child_data, depth + 1, max_depth, py_db, request, processed_refs.copy())
+                            
+#                         except Exception as basic_child_error:
+#                             f.write(f"{indent}    +-- [BASIC CHILD {i+1} ERROR]: {basic_child_error}\n")
+                            
+#                 except Exception as basic_error:
+#                     f.write(f"{indent}    +-- [BASIC ACCESS FAILED]: {type(basic_error).__name__}\n")
+                    
+#         except KeyError:
+#             f.write(f"{indent}    +-- [KEYERROR: Variable {variables_reference} not found]\n")
+            
+#             # 디버깅 정보 추가
+#             try:
+#                 # tracker별 변수 수 확인
+#                 for thread_id, tracker in sfm._thread_id_to_tracker.items():
+#                     try:
+#                         if hasattr(tracker, '_variable_reference_to_variable'):
+#                             var_count = len(tracker._variable_reference_to_variable)
+#                             f.write(f"{indent}    +-- [TRACKER {thread_id}: {var_count} variables]\n")
+#                         elif hasattr(tracker, 'get_all_variable_references'):
+#                             refs = tracker.get_all_variable_references()
+#                             f.write(f"{indent}    +-- [TRACKER {thread_id}: refs {refs[:5]}...]\n")
+#                     except Exception as debug_error:
+#                         f.write(f"{indent}    +-- [TRACKER {thread_id}: debug error {debug_error}]\n")
+#             except Exception as debug_main_error:
+#                 f.write(f"{indent}    +-- [DEBUG ERROR]: {debug_main_error}\n")
+                
+#         except Exception as tracker_error:
+#             f.write(f"{indent}    +-- [TRACKER ERROR]: {type(tracker_error).__name__}: {str(tracker_error)[:100]}\n")
+            
+#     except Exception as main_error:
+#         f.write(f"{indent}    +-- [MAIN ERROR]: {type(main_error).__name__}: {str(main_error)[:100]}\n")
+
+#     # processed_refs에서 제거
+#     processed_refs.discard(variables_reference)
+
+#새로 추가한 debug_all_trackers
+# def debug_all_trackers(py_db, log_f):
+#     """
+#     모든 tracker의 상태를 디버깅하는 함수
+#     """
+#     try:
+#         log_f.write("=== DEBUGGING ALL TRACKERS ===\n")
+        
+#         sfm = py_db.suspended_frames_manager
+        
+#         # 기본 정보
+#         log_f.write(f"_thread_id_to_tracker: {len(sfm._thread_id_to_tracker)} trackers\n")
+#         log_f.write(f"_variable_reference_to_frames_tracker: {len(sfm._variable_reference_to_frames_tracker)} mappings\n")
+        
+#         # 각 tracker 상세 정보
+#         for thread_id, tracker in sfm._thread_id_to_tracker.items():
+#             log_f.write(f"\nTRACKER {thread_id}:\n")
+#             log_f.write(f"  Type: {type(tracker).__name__}\n")
+            
+#             # tracker의 속성들 확인
+#             tracker_attrs = [attr for attr in dir(tracker) if not attr.startswith('__')]
+#             log_f.write(f"  Attributes: {tracker_attrs}\n")
+            
+#             # 변수 관련 속성들 확인
+#             var_attrs = [attr for attr in tracker_attrs if 'variable' in attr.lower()]
+#             for attr in var_attrs:
+#                 try:
+#                     value = getattr(tracker, attr)
+#                     if hasattr(value, '__len__'):
+#                         log_f.write(f"  {attr}: {len(value)} items\n")
+#                         if hasattr(value, 'keys'):
+#                             keys = list(value.keys())[:10]
+#                             log_f.write(f"    Keys: {keys}\n")
+#                     else:
+#                         log_f.write(f"  {attr}: {type(value).__name__}\n")
+#                 except Exception as attr_error:
+#                     log_f.write(f"  {attr}: ERROR {attr_error}\n")
+        
+#         # _variable_reference_to_frames_tracker 내용 확인
+#         log_f.write(f"\nVARIABLE REFERENCE MAPPINGS:\n")
+#         for var_ref, tracker in list(sfm._variable_reference_to_frames_tracker.items())[:10]:
+#             log_f.write(f"  {var_ref} -> {type(tracker).__name__}\n")
+            
+#     except Exception as e:
+#         log_f.write(f"ERROR in debug_all_trackers: {e}\n")
+
+#변수 저장할 때 callstack 정보 추출
+def get_callstack_info(py_db, variables_reference):
+    """
+    실시간 callstack 정보를 추출하는 개선된 함수
+    """
+    try:
+        print(f"\n[CALLSTACK-INFO] Extracting callstack info for variables_reference: {variables_reference}")
+        
+        # 방법 1: suspended_frames_manager를 통한 정확한 정보 추출
+        try:
+            thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+            if thread_id is None:
+                print(f"[CALLSTACK-INFO] thread_id is None")
+                return {
+                    "thread_id": None,
+                    "frame_id": None,
+                    "callstack_level": -1,
+                    "function_name": "unknown",
+                    "filename": "unknown",
+                    "line_number": -1,
+                    "error": "thread_id not found"
+                }
+            
+            print(f"[CALLSTACK-INFO] Found thread_id: {thread_id}")
+            
+            # py_db.find_frame으로 실제 frame 객체 가져오기
+            frame = py_db.find_frame(thread_id, variables_reference)
+            if frame is not None:
+                filename = frame.f_code.co_filename
+                lineno = frame.f_lineno  # 실시간 라인!
+                function_name = frame.f_code.co_name
+                
+                print(f"[CALLSTACK-INFO] SUCCESS via find_frame!")
+                print(f"[CALLSTACK-INFO] File: {filename}")
+                print(f"[CALLSTACK-INFO] Current Line: {lineno}")
+                print(f"[CALLSTACK-INFO] Function: {function_name}")
+                
+                return {
+                    "thread_id": thread_id,
+                    "frame_id": variables_reference,
+                    "callstack_level": 0,  # 현재 프레임이므로 0
+                    "function_name": function_name,
+                    "filename": os.path.basename(filename),
+                    "line_number": lineno,
+                    "error": None
+                }
+            else:
+                print(f"[CALLSTACK-INFO] find_frame returned None")
+                
+        except Exception as e:
+            print(f"[CALLSTACK-INFO] Method 1 failed: {e}")
+        
+        # 방법 2: frames_list를 통한 정보 추출
+        try:
+            thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+            if thread_id and hasattr(py_db.suspended_frames_manager, 'get_frames_list'):
+                frames_list = py_db.suspended_frames_manager.get_frames_list(thread_id)
+                if frames_list:
+                    print(f"[CALLSTACK-INFO] Processing frames_list with {len(frames_list) if hasattr(frames_list, '__len__') else 'unknown'} frames")
+                    
+                    for level, frame_data in enumerate(frames_list):
+                        try:
+                            if isinstance(frame_data, (tuple, list)) and len(frame_data) >= 6:
+                                f_id, frame_obj, method_name, original_filename, filename_in_utf8, lineno = frame_data[:6]
+                                
+                                if f_id == variables_reference or (hasattr(frame_obj, 'f_lineno') and id(frame_obj) == variables_reference):
+                                    # 실시간 정보 우선 사용
+                                    if hasattr(frame_obj, 'f_lineno'):
+                                        actual_filename = frame_obj.f_code.co_filename
+                                        actual_lineno = frame_obj.f_lineno  # 실시간!
+                                        actual_function = frame_obj.f_code.co_name
+                                    else:
+                                        actual_filename = filename_in_utf8 or original_filename
+                                        actual_lineno = lineno
+                                        actual_function = method_name
+                                    
+                                    print(f"[CALLSTACK-INFO] SUCCESS via frames_list!")
+                                    print(f"[CALLSTACK-INFO] Level: {level}")
+                                    print(f"[CALLSTACK-INFO] File: {actual_filename}")
+                                    print(f"[CALLSTACK-INFO] Current Line: {actual_lineno}")
+                                    print(f"[CALLSTACK-INFO] Function: {actual_function}")
+                                    
+                                    return {
+                                        "thread_id": thread_id,
+                                        "frame_id": variables_reference,
+                                        "callstack_level": level,
+                                        "function_name": actual_function or "unknown",
+                                        "filename": os.path.basename(actual_filename) if actual_filename else "unknown",
+                                        "line_number": actual_lineno or -1,
+                                        "error": None
+                                    }
+                                    
+                        except Exception as frame_error:
+                            print(f"[CALLSTACK-INFO] Frame processing error: {frame_error}")
+                            continue
+                            
+        except Exception as e:
+            print(f"[CALLSTACK-INFO] Method 2 failed: {e}")
+        
+        # 모든 방법 실패
+        print(f"[CALLSTACK-INFO] All methods failed")
+        return {
+            "thread_id": thread_id if 'thread_id' in locals() else None,
+            "frame_id": variables_reference,
+            "callstack_level": -1,
+            "function_name": "unknown",
+            "filename": "unknown",
+            "line_number": -1,
+            "error": "unable to extract callstack info"
+        }
+        
+    except Exception as main_error:
+        print(f"[CALLSTACK-INFO ERROR] Critical error: {main_error}")
+        return {
+            "thread_id": None,
+            "frame_id": None,
+            "callstack_level": -1,
+            "function_name": "unknown",
+            "filename": "unknown",
+            "line_number": -1,
+            "error": str(main_error)
+        }
+
+def should_filter_special_variable(var_name, var_type, var_value):
+    """Enhanced Special variable 필터링 - 더 포괄적인 필터링"""
+    if not var_name:
+        return True
+    
+    # 1. Special categories that VSCode shows
+    special_categories = {
+        "special variables", "class variables",
+        "protected variables", "private variables"
+    }
+    if var_name.lower() in special_categories:
+        return True
+    
+    lambda_parameters = {"event", "context"}
+    if var_name in lambda_parameters:
+        return True
+    
+    # 2. System and built-in variables (확장)
+    system_variables = {
+        "__builtins__", "__cached__", "__loader__", "__spec__", "__package__",
+        "__path__", "__file__", "__annotations__", "__dict__", "__module__",
+        "__qualname__", "__slots__", "__weakref__", "__orig_bases__",
+        "__parameters__", "__origin__", "__args__", "__mro_entries__"
+    }
+    
+    # 중요한 dunder 변수들만 유지
+    important_dunders = {"__name__", "__doc__", "__class__"}
+    
+    if (var_name.startswith("__") and var_name.endswith("__") and 
+        var_name not in important_dunders):
+        if var_name in system_variables:
+            return True
+    
+    # 3. 디버깅 관련 변수들
+    debug_variables = {
+        "__traceback__", "__context__", "__cause__", "__suppress_context__",
+        "__frame__", "__locals__", "__globals__", "__code__"
+    }
+    if var_name in debug_variables:
+        return True
+    
+    # 4. Built-in 모듈들 (대폭 확장)
+    if var_type == "module":
+        builtin_modules = {
+            "sys", "os", "builtins", "types", "collections", "itertools",
+            "functools", "operator", "weakref", "gc", "inspect", "linecache",
+            "threading", "traceback", "warnings", "importlib", "re", "json",
+            "time", "datetime", "math", "random", "socket", "urllib", "http",
+            "pickle", "copy", "io", "contextlib", "enum", "abc", "typing",
+            "dataclasses", "pathlib", "shutil", "subprocess", "signal",
+            "platform", "locale", "calendar", "decimal", "fractions",
+            "statistics", "zlib", "gzip", "tarfile", "zipfile", "csv",
+            "xml", "html", "email", "base64", "binascii", "hashlib",
+            "hmac", "secrets", "ssl", "asyncio", "concurrent", "multiprocessing",
+            "queue", "sched", "select", "selectors", "sqlite3", "dbm",
+            "unittest", "doctest", "pdb", "profile", "cProfile", "timeit",
+            "trace", "dis", "py_compile", "compileall", "keyword", "token",
+            "tokenize", "ast", "symtable", "code", "codeop", "runpy",
+            "pkgutil", "modulefinder", "imp", "zipimport", "encodings"
+        }
+        
+        # 모듈 이름 추출 시도
+        module_name = None
+        if "'" in var_value and "module" in var_value:
+            try:
+                parts = var_value.split("'")
+                if len(parts) >= 2:
+                    module_name = parts[1]
+            except:
+                pass
+        
+        if module_name in builtin_modules:
+            return True
+    
+    # 5. Name mangling 감지 함수
+    def is_name_mangled_private_field(name):
+        """Name mangling된 private field인지 확인 (_ClassName__fieldname 패턴)"""
+        if not name.startswith("_"):
+            return False
+        
+        # _ClassName__fieldname 패턴 확인
+        parts = name[1:].split("__", 1)  # 첫 번째 _를 제거하고 __로 분할
+        if len(parts) == 2:
+            class_name, field_name = parts
+            # 클래스명이 비어있지 않고, 필드명도 비어있지 않아야 함
+            if class_name and field_name and class_name[0].isupper():
+                return True
+        return False
+    
+    # 5. Private 변수들 (name mangling된 private field는 제외)
+    if var_name.startswith("_") and not var_name.startswith("__"):
+        # Name mangling된 private field는 필터링하지 않음
+        if is_name_mangled_private_field(var_name):
+            return False
+        
+        important_privates = {"_", "_1", "_2", "_3", "_last_traceback"}
+        if var_name not in important_privates and len(var_name) > 2:
+            return True
+    
+    # 6. 타입별 특수 필터링
+    if var_type in ["method", "builtin_function_or_method", "wrapper_descriptor", 
+                    "method_descriptor", "classmethod_descriptor", "staticmethod"]:
+        common_methods = {"__init__", "__str__", "__repr__", "append", "extend", 
+                         "insert", "remove", "pop", "clear", "index", "count",
+                         "get", "keys", "values", "items", "update"}
+        if var_name not in common_methods and var_name.startswith("__"):
+            return True
+    
+    # 7. 큰 컬렉션의 내부 구현
+    if var_type in ["dict_keys", "dict_values", "dict_items", "range",
+                    "enumerate", "zip", "filter", "map"]:
+        return True
+    
+    return False
+
+def should_filter_by_context(var_name, var_type, var_value, current_depth, parent_type=None):
+    """컨텍스트 기반 필터링 - depth와 부모 타입에 따른 스마트 필터링"""
+    
+    # 1. Depth 기반 필터링
+    if current_depth >= 5:  # 깊이 5 이상에서는 더 엄격하게
+        # 원시 타입이 아닌 것들은 더 제한적으로
+        if var_type not in ["int", "float", "str", "bool", "NoneType"]:
+            # 컬렉션이라면 크기 제한
+            if var_type in ["list", "tuple", "dict", "set"]:
+                if "length" in var_value or len(var_value) > 100:
+                    return True
+            else:
+                return True
+    
+    # 2. 부모 타입에 따른 필터링
+    if parent_type:
+        # 모듈의 자식들은 더 엄격하게
+        if parent_type == "module":
+            if var_name.startswith("_") or var_type in ["function", "type", "module"]:
+                return True
+        
+        # 클래스의 자식들
+        elif parent_type == "type":
+            if var_name.startswith("__") and var_name not in ["__init__", "__str__", "__repr__"]:
+                return True
+    
+    # 3. 순환 참조 가능성이 높은 것들
+    circular_prone = ["__class__", "__dict__", "__module__", "im_class", "im_self"]
+    if var_name in circular_prone:
+        return True
+    
+    return False
+
+# def categorize_variable_by_scope(py_db, variables_reference, child_var, fmt):
+#     """변수를 locals/globals로 분류"""
+#     try:
+#         var_data = child_var.get_var_data(fmt=fmt)
+#         var_name = var_data.get("name", "")
+#         var_type = var_data.get("type", "")
+#         var_value = str(var_data.get("value", ""))
+        
+#         if should_filter_special_variable(var_name, var_type, var_value):
+#             return None, None
+        
+#         from _pydevd_bundle.pydevd_utils import ScopeRequest
+        
+#         if hasattr(py_db.suspended_frames_manager, '_variable_to_scope'):
+#             scope_info = py_db.suspended_frames_manager._variable_to_scope.get(variables_reference)
+#             if scope_info and hasattr(scope_info, 'scope'):
+#                 if scope_info.scope == "locals":
+#                     return "locals", var_data
+#                 elif scope_info.scope == "globals":
+#                     return "globals", var_data
+        
+#         if var_type in ["module", "type", "function", "builtin_function_or_method"]:
+#             return "globals", var_data
+        
+#         if var_type == "module" or (var_type == "type" and "<class" in var_value):
+#             return "globals", var_data
+        
+#         return "locals", var_data
+        
+#     except Exception as e:
+#         print(f"Error categorizing variable: {e}")
+#         return None, None
+    
+def get_stacks_accurate_callstack(py_db, thread_id=None):
+    """
+    ✅ stacks.py의 dump 함수 로직을 완전히 활용한 정확한 callstack 추출
+    """
+    try:
+        import traceback as tb_module
+        import threading
+        import sys
+        current_tid = threading.current_thread().ident
+        target_tid = current_tid
+        
+        # 특정 thread_id 찾기
+        if thread_id:
+            for t in threading.enumerate():
+                if (str(t.ident) in str(thread_id) or 
+                    t.name in str(thread_id) or
+                    str(t.ident) == str(thread_id).split('_')[-1]):
+                    target_tid = t.ident
+                    break
+        
+        print(f"[STACKS] Extracting callstack for thread {target_tid}")
+        
+        # sys._current_frames()에서 프레임 가져오기 (stacks.py와 동일)
+        current_frames = sys._current_frames()
+        frame = current_frames.get(target_tid)
+        
+        if frame is None:
+            print(f"[STACKS] No frame found for thread {target_tid}")
+            return []
+        
+        # 스레드 정보 (stacks.py와 동일)
+        thread_name = "<unknown>"
+        thread_daemon = False
+        for t in threading.enumerate():
+            if t.ident == target_tid:
+                thread_name = t.name
+                thread_daemon = t.daemon
+                break
+        
+        # traceback.format_stack() 사용 (stacks.py와 동일)
+        stack = tb_module.format_stack(frame)
+        parsed_stack = []
+        
+        for entry in stack:
+            try:
+                parts = entry.strip().split('\n')
+                if len(parts) < 2:
+                    continue
+                    
+                location_part = parts[0].strip()
+                code_line = parts[1].strip()
+                
+                # stacks.py와 동일한 파싱 로직
+                file_info = location_part.split(', ')
+                if len(file_info) >= 3:
+                    # 파일 경로
+                    file_part = file_info[0].strip()
+                    if '"' in file_part:
+                        file_path = file_part.split('"')[1]
+                    else:
+                        continue
+                    
+                    # 라인 번호
+                    line_part = file_info[1].strip()
+                    if "line " in line_part:
+                        try:
+                            line_number = int(line_part.replace("line ", ""))
+                        except ValueError:
+                            line_number = -1
+                    else:
+                        line_number = -1
+                    
+                    # 함수명
+                    func_part = file_info[2].strip()
+                    if "in " in func_part:
+                        function_name = func_part.replace("in ", "")
+                    else:
+                        function_name = "unknown"
+                    
+                    # 사용자 코드만 필터링 (stacks.py 스타일)
+                    exclude_patterns = [
+                        'pydevd', 'debugpy', '_pydev', 'site-packages',
+                        '<string>', '<stdin>', '<console>', 'runpy.py',
+                        'threading.py', 'queue.py', 'importlib'
+                    ]
+                    
+                    should_include = True
+                    for pattern in exclude_patterns:
+                        if pattern in file_path.lower():
+                            should_include = False
+                            break
+                    
+                    if file_path.startswith('<') and file_path.endswith('>'):
+                        should_include = False
+                    
+                    if should_include:
+                        parsed_frame = {
+                            'file': file_path,
+                            'line': line_number,
+                            'function': function_name,
+                            'code': code_line,
+                            'thread_id': target_tid,
+                            'thread_name': thread_name,
+                            'thread_daemon': thread_daemon
+                        }
+                        parsed_stack.append(parsed_frame)
+                        
+            except Exception as parse_error:
+                print(f"[STACKS] Error parsing entry: {parse_error}")
+                continue
+        
+        # 역순 정렬 (최상위 호출부터)
+        parsed_stack.reverse()
+        
+        print(f"[STACKS] Extracted {len(parsed_stack)} accurate frames")
+        return parsed_stack
+        
+    except Exception as e:
+        print(f"[STACKS] Error in get_stacks_accurate_callstack: {e}")
+        import traceback as tb_module
+        tb_module.print_exc()
+        return []
+
+# def create_accurate_callstacks_with_variables(py_db, thread_id, current_variables_reference, current_locals, current_globals, max_levels=5):
+#     """
+#     ✅ stacks.py 로직으로 정확한 callstack과 변수 정보 결합
+#     """
+#     try:
+#         callstacks = []
+        
+#         # stacks.py 로직으로 정확한 프레임들 가져오기
+#         accurate_frames = get_stacks_accurate_callstack(py_db, thread_id)
+        
+#         if not accurate_frames:
+#             print("[STACKS] No accurate frames, creating single frame from current data")
+#             # fallback: 현재 정보로라도 하나의 프레임 생성
+#             try:
+#                 current_info = get_callstack_info(py_db, current_variables_reference)
+#                 fallback_frame = {
+#                     "frame_id": current_info.get("frame_id", "fallback_frame"),
+#                     "file": current_info.get("filename", "unknown"),
+#                     "line": current_info.get("line_number", -1),
+#                     "function": current_info.get("function_name", "unknown"),
+#                     "code": "# Code not available via stacks.py",
+#                     "variables": {
+#                         "locals": current_locals,
+#                         "globals": current_globals
+#                     },
+#                     "counts": {
+#                         "total_locals": len(current_locals),
+#                         "total_globals": len(current_globals),
+#                         "total_variables": len(current_locals) + len(current_globals)
+#                     },
+#                     "extraction_method": "fallback"
+#                 }
+#                 callstacks.append(fallback_frame)
+#             except Exception as fallback_error:
+#                 print(f"[STACKS] Fallback also failed: {fallback_error}")
+            
+#             return callstacks
+        
+#         # 정확한 프레임들을 callstack 구조로 변환
+#         for level, frame_info in enumerate(accurate_frames[:max_levels]):
+#             try:
+#                 # ✅ stacks.py에서 가져온 정확한 정보 사용
+#                 callstack_entry = {
+#                     "frame_id": f"stacks_frame_{level}_{hash(frame_info['file'] + str(frame_info['line']))}",
+#                     "file": frame_info['file'],
+#                     "line": frame_info['line'], 
+#                     "function": frame_info['function'],
+#                     "code": frame_info['code'],
+#                     "variables": {
+#                         "locals": [],
+#                         "globals": []
+#                     },
+#                     "counts": {
+#                         "total_locals": 0,
+#                         "total_globals": 0,
+#                         "total_variables": 0
+#                     },
+#                     "thread_info": {
+#                         "thread_id": frame_info['thread_id'],
+#                         "thread_name": frame_info['thread_name'],
+#                         "thread_daemon": frame_info['thread_daemon']
+#                     },
+#                     "extraction_method": "stacks.py"
+#                 }
+                
+#                 # 첫 번째 프레임(현재 중단 위치)에 실제 변수 정보 추가
+#                 if level == 0:
+#                     callstack_entry["variables"]["locals"] = current_locals
+#                     callstack_entry["variables"]["globals"] = current_globals
+#                     callstack_entry["counts"]["total_locals"] = len(current_locals)
+#                     callstack_entry["counts"]["total_globals"] = len(current_globals)
+#                     callstack_entry["counts"]["total_variables"] = len(current_locals) + len(current_globals)
+                    
+#                     # 원본 frame_id도 보존
+#                     try:
+#                         original_info = get_callstack_info(py_db, current_variables_reference)
+#                         if original_info.get("frame_id"):
+#                             callstack_entry["original_frame_id"] = original_info["frame_id"]
+#                             callstack_entry["frame_id"] = original_info["frame_id"]  # 원본 사용
+#                     except Exception as original_error:
+#                         print(f"[STACKS] Could not get original frame_id: {original_error}")
+                
+#                 callstacks.append(callstack_entry)
+                
+#             except Exception as frame_error:
+#                 print(f"[STACKS] Error processing frame {level}: {frame_error}")
+        
+#         print(f"[STACKS] Created {len(callstacks)} callstack entries")
+#         return callstacks
+        
+#     except Exception as e:
+#         print(f"[STACKS] Error in create_accurate_callstacks_with_variables: {e}")
+#         return []
+
+# def save_stacks_debug_dump(py_db, thread_id, seq, accurate_frames):
+#     """
+#     ✅ stacks.py 스타일의 디버그 덤프 파일 저장
+#     """
+#     try:
+#         save_dir = "src/debug_data"
+#         if not os.path.exists(save_dir):
+#             os.makedirs(save_dir)
+        
+#         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+#         # JSON 형태 저장
+#         stacks_json = f"{save_dir}/stacks_debug_dump_{seq}_{timestamp}.json"
+#         stacks_data = {
+#             "timestamp": datetime.now().isoformat(),
+#             "process_id": os.getpid(),
+#             "thread_id": thread_id,
+#             "total_frames": len(accurate_frames),
+#             "frames": accurate_frames
+#         }
+        
+#         with open(stacks_json, "w", encoding="utf-8") as f:
+#             json.dump(stacks_data, f, indent=2, ensure_ascii=False)
+        
+#         # 텍스트 형태 저장 (읽기 쉬움)
+#         stacks_txt = f"{save_dir}/stacks_debug_dump_{seq}_{timestamp}.txt"
+        
+#         with open(stacks_txt, "w", encoding="utf-8") as f:
+#             f.write(f"Stack Debug Dump (stacks.py style)\n")
+#             f.write(f"{'='*70}\n")
+#             f.write(f"Process ID: {os.getpid()}\n")
+#             f.write(f"Thread ID: {thread_id}\n")
+#             f.write(f"Timestamp: {stacks_data['timestamp']}\n")
+#             f.write(f"Total Frames: {len(accurate_frames)}\n")
+#             f.write(f"{'='*70}\n\n")
+            
+#             for i, frame in enumerate(accurate_frames):
+#                 f.write(f"Frame {i}:\n")
+#                 f.write(f"  File: {frame['file']}\n")
+#                 f.write(f"  Line: {frame['line']}\n")
+#                 f.write(f"  Function: {frame['function']}\n")
+#                 f.write(f"  Code: {frame['code']}\n")
+#                 f.write(f"  Thread: {frame['thread_name']} (ID: {frame['thread_id']})\n")
+#                 f.write(f"\n")
+        
+#         print(f"[STACKS] Debug dump saved to {stacks_json} and {stacks_txt}")
+#         return stacks_json
+        
+#     except Exception as e:
+#         print(f"[STACKS] Error saving debug dump: {e}")
+#         return None
+  
+def send_file_to_local(file_path):
+    """람다에서 로컬 PC로 파일 전송 (DAP 방식으로 수정)"""
+    try:
+        print(f"📤 [FILE-SEND] 파일 전송 시작: {os.path.basename(file_path)}")
+        
+        # 파일 내용 읽기
+        with open(file_path, 'r', encoding='utf-8') as f:
+            file_content = f.read()
+        
+        try:
+            # 파일 내용을 JSON으로 파싱하여 딕셔너리로 변환
+            file_content_dict = json.loads(file_content)
+            print(f"ℹ️ [FILE-SEND] 파일 내용을 JSON 딕셔너리로 변환 성공.")
+        except Exception as e:
+            print(f"⚠️ [FILE-SEND] 파일 내용 변환 중 예기치 않은 오류: {e}. 원본 문자열로 전송합니다.")
+            file_content_dict = {"error": f"Unexpected error during content conversion: {e}", "raw_content": file_content}
+    
+        # 소켓 연결 및 전송
+        sock = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+        
+        try:
+            sock.settimeout(15.0)  # 15초 타임아웃 (더 여유있게)
+            print(f"📤 [FILE-SEND] 연결 시도...")
+            sock.connect(("165.194.27.222", 6689))
+            print(f"📤 [FILE-SEND] 연결 성공!")
+            
+            # DAP 방식으로 전송
+            success = send_dap_message(sock, file_content_dict, "CAPT")
+            
+            if success:
+                print(f"📤 [FILE-SEND] DAP 전송 완료: {os.path.basename(file_path)}")
+                return True
+            else:
+                print(f"❌ [FILE-SEND] DAP 전송 실패")
+                return False
+            
+        finally:
+            try:
+                sock.close()
+                print(f"📤 [FILE-SEND] 소켓 닫음")
+            except:
+                pass
+        
+    except Exception as e:
+        print(f"❗ [FILE-SEND] 파일 전송 실패 ({file_path}): {e}")
+        import traceback
+        print(f"❗ [FILE-SEND] 상세 에러: {traceback.format_exc()}")
+        return False
+    
+def send_dap_message(sock, data, message_type_str: str):
+    """
+    지정된 타입과 데이터를 사용하여 고정 크기 헤더와 가변 크기 바디로 구성된 메시지를 전송합니다.
+    헤더는 4바이트 메시지 타입 문자열과 4바이트 바디 크기 정수로 구성됩니다. (총 8바이트 헤더)
+    수신측에서는 이 헤더를 먼저 읽고 파싱하여 바디의 크기를 알아낸 후, 해당 크기만큼 바디를 읽습니다.
+
+    :param sock: 소켓 객체
+    :param data: 전송할 데이터 (dict만 지원 - 자동으로 JSON 변환됨)
+    :param message_type_str: 메시지 타입을 나타내는 4자리 문자열 (예: "TIME", "SHUT", "CAPT").
+                             4자보다 짧으면 공백으로 패딩되고, 길면 4자로 절단됩니다.
+    :return: 성공 시 True, 실패 시 False
+    """
+    try:
+        # 모든 데이터는 dict → JSON으로 처리 (프로토콜 단순화)
+        if isinstance(data, dict):
+            body_bytes = json.dumps(data).encode('utf-8')
+        else:
+            error_msg = f"Unsupported data type: {type(data)}. Only dict is supported (automatically converted to JSON)."
+            print(f"❌ [DAP-SEND] 데이터 타입 오류 ({message_type_str}): {error_msg}")
+            raise TypeError(error_msg)
+
+        body_length = len(body_bytes)
+
+        # 헤더 생성 (총 8바이트)
+        # 1. 메시지 타입 (4바이트 ASCII)
+        type_str_fixed_length = message_type_str.ljust(4)[:4]
+        type_bytes_for_header = type_str_fixed_length.encode('ascii')
+
+        # 2. 바디 길이 (4바이트 big-endian unsigned integer)
+        body_length_bytes = struct.pack('>I', body_length)
+
+        header_bytes = type_bytes_for_header + body_length_bytes
+        
+        message_to_send = header_bytes + body_bytes
+        sock.sendall(message_to_send)
+        
+        total_sent = len(message_to_send)
+        print(f"📤 [DAP-SEND] '{message_type_str}' 전송 완료: header={len(header_bytes)}B, body={body_length}B. 총 {total_sent}B.")
+        return True
+        
+    except TypeError: 
+        return False 
+    except Exception as e:
+        print(f"❌ [DAP-SEND] '{message_type_str}' 전송 실패 (오류: {type(e).__name__}): {e}")
+        return False
 
 @silence_warnings_decorator
 def internal_get_variable_json(py_db, request):
     """
-    :param VariablesRequest request:
+    필터링된 완전한 콜스택 수집: 사용자 파일의 모든 프레임만 수집 (개선된 필터링 적용)
     """
-    arguments = request.arguments  # : :type arguments: VariablesArguments
+    
+    arguments = request.arguments
     variables_reference = arguments.variablesReference
     scope = None
-    if isinstance_checked(variables_reference, ScopeRequest):
+    scope_type = None
+    
+    from _pydevd_bundle.pydevd_utils import ScopeRequest
+    if isinstance(variables_reference, ScopeRequest):
         scope = variables_reference
+        scope_type = scope.scope
         variables_reference = variables_reference.variable_reference
 
     fmt = arguments.format
     if hasattr(fmt, "to_dict"):
         fmt = fmt.to_dict()
 
-    variables = []
-    try:
-        try:
-            variable = py_db.suspended_frames_manager.get_variable(variables_reference)
-        except KeyError:
-            pass
-        else:
-            for child_var in variable.get_children_variables(fmt=fmt, scope=scope):
-                variables.append(child_var.get_var_data(fmt=fmt))
-    except:
-        try:
-            exc, exc_type, tb = sys.exc_info()
-            err = "".join(traceback.format_exception(exc, exc_type, tb))
-            variables = [{"name": "<error>", "value": err, "type": "<error>", "variablesReference": 0}]
-        except:
-            err = "<Internal error - unable to get traceback when getting variables>"
-            pydev_log.exception(err)
-            variables = []
+    print(f"[FILTERED-DEBUG] Processing variables for reference: {variables_reference}, scope: {scope_type}")
 
-    body = VariablesResponseBody(variables)
+    # VS Code 응답용 변수 수집 (요청된 scope만)
+    variables_for_vscode = []
+    try:
+        variable = py_db.suspended_frames_manager.get_variable(variables_reference)
+        if variable:
+            children = variable.get_children_variables(fmt=fmt, scope=scope)
+            for child_var in children:
+                var_data = child_var.get_var_data(fmt=fmt)
+                variables_for_vscode.append(var_data)
+            print(f"[FILTERED-DEBUG] VS Code 응답용 {scope_type}: {len(variables_for_vscode)} variables")
+    except Exception as e:
+        print(f"[FILTERED-DEBUG] VS Code 응답 처리 실패: {e}")
+        variables_for_vscode = []
+
+    # 🚀 핵심: 개선된 필터링으로 사용자 파일의 전체 콜스택 강제 수집
+    try:
+        print(f"[FILTERED-DEBUG] 🔄 Starting improved filtered complete callstack collection...")
+        
+        thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+        if not thread_id:
+            print(f"[FILTERED-DEBUG] ❌ No thread_id found")
+            raise Exception("No thread_id found")
+        
+        # 전체 프레임 리스트 가져오기
+        frames_list = py_db.suspended_frames_manager.get_frames_list(thread_id)
+        if not frames_list:
+            print(f"[FILTERED-DEBUG] ❌ No frames list found")
+            raise Exception("No frames list found")
+        
+        print(f"[FILTERED-DEBUG] Found {len(frames_list)} total frames, filtering for user files...")
+        
+        # 🔥 개선된 is_user_code_file()로 사용자 파일만 필터링하여 수집
+        user_callstack = []
+        
+        for frame_index, frame_data in enumerate(frames_list):
+            try:
+                # 🔍 프레임 데이터 구조 디버깅
+                print(f"[FILTERED-DEBUG] Frame {frame_index} type: {type(frame_data)}, data: {frame_data}")
+                
+                # 🚀 다양한 프레임 데이터 형식 처리
+                frame_id = None
+                frame_obj = None
+                method_name = None
+                original_filename = None
+                filename_in_utf8 = None
+                lineno = None
+                
+                if hasattr(frame_data, 'f_code'):
+                    # 🚀 Python frame 객체 직접 처리 (최우선)
+                    print(f"[FILTERED-DEBUG] Frame {frame_index} is Python frame object")
+                    frame_id = id(frame_data)  # frame 객체의 id를 frame_id로 사용
+                    frame_obj = frame_data
+                    method_name = frame_data.f_code.co_name
+                    filename_in_utf8 = frame_data.f_code.co_filename
+                    original_filename = filename_in_utf8
+                    lineno = frame_data.f_lineno
+                    
+                elif isinstance(frame_data, (tuple, list)):
+                    frame_data_len = len(frame_data)
+                    print(f"[FILTERED-DEBUG] Frame {frame_index} length: {frame_data_len}")
+                    
+                    if frame_data_len >= 6:
+                        # 표준 형식: (frame_id, frame_obj, method_name, original_filename, filename_in_utf8, lineno, ...)
+                        frame_id, frame_obj, method_name, original_filename, filename_in_utf8, lineno = frame_data[:6]
+                    elif frame_data_len >= 4:
+                        # 축약 형식: (frame_id, frame_obj, method_name, filename)
+                        frame_id, frame_obj, method_name, filename_in_utf8 = frame_data[:4]
+                        original_filename = filename_in_utf8
+                        lineno = getattr(frame_obj, 'f_lineno', -1) if frame_obj else -1
+                    elif frame_data_len >= 3:
+                        # 최소 형식: (frame_id, frame_obj, method_name)
+                        frame_id, frame_obj, method_name = frame_data[:3]
+                        if frame_obj and hasattr(frame_obj, 'f_code'):
+                            filename_in_utf8 = frame_obj.f_code.co_filename
+                            original_filename = filename_in_utf8
+                            lineno = frame_obj.f_lineno
+                        else:
+                            filename_in_utf8 = "unknown.py"
+                            original_filename = filename_in_utf8
+                            lineno = -1
+                    else:
+                        print(f"[FILTERED-DEBUG] ⚠️ Frame {frame_index}: insufficient data length ({frame_data_len})")
+                        continue
+                        
+                elif hasattr(frame_data, '__dict__'):
+                    # 객체 형식
+                    print(f"[FILTERED-DEBUG] Frame {frame_index} object attributes: {dir(frame_data)}")
+                    frame_id = getattr(frame_data, 'frame_id', frame_index)
+                    frame_obj = getattr(frame_data, 'frame', None)
+                    method_name = getattr(frame_data, 'name', 'unknown')
+                    filename_in_utf8 = getattr(frame_data, 'filename', None)
+                    original_filename = filename_in_utf8
+                    lineno = getattr(frame_data, 'lineno', -1)
+                else:
+                    print(f"[FILTERED-DEBUG] ⚠️ Frame {frame_index}: unknown data format")
+                    continue
+                
+                # 기본값 설정
+                if not method_name:
+                    method_name = "unknown_function"
+                if not filename_in_utf8:
+                    filename_in_utf8 = "unknown.py"
+                if not original_filename:
+                    original_filename = filename_in_utf8
+                if lineno is None:
+                    lineno = -1
+                
+                print(f"[FILTERED-DEBUG] Frame {frame_index} parsed: {method_name} in {os.path.basename(filename_in_utf8)}:{lineno}")
+                
+                # 🚀 개선된 사용자 파일 필터링
+                target_filename = filename_in_utf8 or original_filename
+                if not is_user_code_file(target_filename):
+                    continue
+                
+                print(f"[FILTERED-DEBUG] ✅ Processing user frame {len(user_callstack)}: {method_name} at {os.path.basename(target_filename)}:{lineno}")
+                
+                # 각 프레임의 locals와 globals 강제 수집
+                frame_locals = []
+                frame_globals = []
+                
+                try:
+                    from _pydevd_bundle.pydevd_utils import ScopeRequest
+                    
+                    # locals 수집
+                    locals_scope = ScopeRequest(frame_id, "locals")
+                    variable = py_db.suspended_frames_manager.get_variable(frame_id)
+                    if variable:
+                        locals_children = variable.get_children_variables(fmt=fmt, scope=locals_scope)
+                        for child_var in locals_children:
+                            try:
+                                var_data = child_var.get_var_data(fmt=fmt)
+                                var_name = var_data.get("name", "")
+                                var_type = var_data.get("type", "")
+                                var_value = str(var_data.get("value", ""))
+                                
+                                # 필터링 적용
+                                if should_filter_special_variable(var_name, var_type, var_value):
+                                    continue
+                                
+                                # 재귀적 수집
+                                enhanced_var_data = collect_recursive_children(py_db, var_data)
+                                frame_locals.append(enhanced_var_data)
+                                
+                            except Exception as var_error:
+                                print(f"[SCOPE-COLLECT] Error processing locals variable: {var_error}")
+                                continue
+                    
+                    # globals 수집
+                    globals_scope = ScopeRequest(frame_id, "globals")
+                    if variable:
+                        globals_children = variable.get_children_variables(fmt=fmt, scope=globals_scope)
+                        for child_var in globals_children:
+                            try:
+                                var_data = child_var.get_var_data(fmt=fmt)
+                                var_name = var_data.get("name", "")
+                                var_type = var_data.get("type", "")
+                                var_value = str(var_data.get("value", ""))
+                                
+                                # 필터링 적용
+                                if should_filter_special_variable(var_name, var_type, var_value):
+                                    continue
+                                
+                                # 재귀적 수집
+                                enhanced_var_data = collect_recursive_children(py_db, var_data)
+                                frame_globals.append(enhanced_var_data)
+                                
+                            except Exception as var_error:
+                                print(f"[SCOPE-COLLECT] Error processing globals variable: {var_error}")
+                                continue
+                        
+                except Exception as scope_error:
+                    print(f"[SCOPE-COLLECT] ❌ Error collecting variables for frame {frame_id}: {scope_error}")
+                
+                # 코드 라인 가져오기
+                code = ""
+                try:
+                    import linecache
+                    line_text = linecache.getline(target_filename, lineno)
+                    if line_text:
+                        code = line_text.strip()
+                    else:
+                        code = f"# {method_name} (line {lineno})"
+                except Exception:
+                    code = f"# {method_name}"
+                
+                # 프레임 정보 구성
+                frame_info = {
+                    "frame_id": frame_id,
+                    "file": os.path.basename(target_filename) if target_filename else "unknown",
+                    "full_file": target_filename,
+                    "line": lineno,
+                    "function": method_name,
+                    "code": code,
+                    "variables": {
+                        "locals": frame_locals,
+                        "globals": frame_globals
+                    },
+                    "counts": {
+                        "total_locals": len(frame_locals),
+                        "total_globals": len(frame_globals),
+                        "total_variables": len(frame_locals) + len(frame_globals)
+                    },
+                    "user_frame_index": len(user_callstack),  # 사용자 프레임 내에서의 인덱스
+                    "original_frame_index": frame_index,      # 전체 스택에서의 원본 인덱스
+                    "is_current_frame": (frame_id == variables_reference),
+                    "is_user_code": True
+                }
+                
+                user_callstack.append(frame_info)
+                
+                print(f"[FILTERED-DEBUG] ✅ User frame {len(user_callstack)-1} ({method_name}): L:{len(frame_locals)} G:{len(frame_globals)}")
+                
+            except Exception as frame_error:
+                print(f"[FILTERED-DEBUG] ❌ Error processing frame {frame_index}: {frame_error}")
+                import traceback
+                print(f"[FILTERED-DEBUG] ❌ Frame error traceback: {traceback.format_exc()}")
+                continue
+        
+        print(f"[FILTERED-DEBUG] ✅ Collected filtered callstack: {len(user_callstack)} user frames (from {len(frames_list)} total)")
+        
+        # 🔥 호출 순서대로 정렬 (역순으로 변경)
+        user_callstack.reverse()
+        
+        # 인덱스 재조정 (호출 순서 기준)
+        for i, frame in enumerate(user_callstack):
+            frame["user_frame_index"] = i
+            frame["is_current_frame"] = (i == len(user_callstack) - 1)  # 마지막이 현재 프레임
+        
+        print(f"[FILTERED-DEBUG] ✅ Reordered callstack (call order): {len(user_callstack)} frames")
+        
+    except Exception as main_collection_error:
+        print(f"[FILTERED-DEBUG] ❌ Main collection error: {main_collection_error}")
+        user_callstack = []
+
+    # JSON 파일 저장 및 전송
+    try:
+        save_dir = "/tmp"
+        session_filename = f"{save_dir}/filtered_callstack_variables_{thread_id}.json"
+        
+        # 세션 데이터 구성
+        session_data = {
+            "timestamp": datetime.now().isoformat(),
+            "thread_id": thread_id,
+            "extraction_method": "improved_filtered_user_files_only",
+            "current_request": {
+                "frame_id": variables_reference,
+                "scope_type": scope_type
+            },
+            "callstacks": user_callstack  # 개선된 필터링으로 수집된 사용자 파일의 프레임만
+        }
+        
+        # 파일 저장
+        with open(session_filename, "w", encoding="utf-8") as f:
+            json.dump(session_data, f, indent=2, ensure_ascii=False)
+
+        print(f"[FILTERED-DEBUG] 💾 Filtered callstack saved: {session_filename}")
+        
+        # 파일 저장 확인
+        if os.path.exists(session_filename):
+            file_size = os.path.getsize(session_filename)
+            print(f"[FILTERED-DEBUG] 📁 File confirmed: {file_size} bytes")
+        else:
+            print(f"[FILTERED-DEBUG] ❌ File save failed!")
+            return
+        
+        # 사용자 콜스택 요약 출력
+        print(f"[FILTERED-DEBUG] 📊 User callstack summary:")
+        for i, frame in enumerate(user_callstack):
+            marker = "🔴" if frame["is_current_frame"] else "⚪"
+            locals_count = frame["counts"]["total_locals"]
+            globals_count = frame["counts"]["total_globals"]
+            print(f"  {marker} [{i}] {frame['function']} | {frame['file']}:{frame['line']} | L:{locals_count} G:{globals_count}")
+
+        # 🚀 사용자 프레임이 있으면 전송
+        if user_callstack:
+            print(f"[FILTERED-DEBUG] 🚀 User callstack ready! Sending to developer PC...")
+            print(f"[FILTERED-DEBUG] 📤 Calling send_file_to_local({session_filename})")
+            
+            try:
+                success = send_file_to_local(session_filename)
+                print(f"[FILTERED-DEBUG] 📤 send_file_to_local returned: {success}")
+                
+                if success:
+                    print(f"[FILTERED-DEBUG] ✅ Filtered callstack sent successfully!")
+                else:
+                    print(f"[FILTERED-DEBUG] ❌ Filtered callstack send failed!")
+                    
+            except Exception as send_error:
+                print(f"[FILTERED-DEBUG] ❌ send_file_to_local exception: {send_error}")
+                import traceback
+                print(f"[FILTERED-DEBUG] ❌ Send traceback: {traceback.format_exc()}")
+        else:
+            print(f"[FILTERED-DEBUG] ⚠️ No user frames collected, skipping transmission")
+
+    except Exception as e:
+        print(f"[FILTERED-DEBUG] Failed to save/transfer filtered callstack: {e}")
+        import traceback
+        print(f"[FILTERED-DEBUG] Traceback: {traceback.format_exc()}")
+
+    print(f"[FILTERED-DEBUG] Filtered callstack collection finished")
+
+    # DAP 응답 생성 (VS Code에게는 요청된 scope만 반환)
+    from _pydevd_bundle._debug_adapter.pydevd_schema import VariablesResponseBody
+    from _pydevd_bundle._debug_adapter import pydevd_base_schema
+    from _pydevd_bundle.pydevd_net_command import NetCommand
+    from _pydevd_bundle.pydevd_comm_constants import CMD_RETURN
+    
+    body = VariablesResponseBody(variables_for_vscode)
     variables_response = pydevd_base_schema.build_response(request, kwargs={"body": body})
     py_db.writer.add_command(NetCommand(CMD_RETURN, 0, variables_response, is_json=True))
 
+def is_user_code_file(filename):
+    """
+    🔥 개선된 사용자 코드 파일 판별 (더 정확한 필터링)
+    """
+    if not filename:
+        return False
+    
+    # 파일명 정규화
+    filename_lower = filename.lower()
+    basename = os.path.basename(filename)
+    
+    # 🚀 사용자 코드 패턴들 (우선순위 - 이게 있으면 무조건 사용자 코드)
+    user_patterns = [
+        '/var/task/',          # AWS Lambda 사용자 코드
+        '/app/',               # Docker 앱 경로
+        '/workspace/',         # 개발 워크스페이스
+        '/src/',               # 소스 코드 디렉토리
+        '/code/',              # 코드 디렉토리
+        '/home/',              # 홈 디렉토리
+        '/Users/',             # macOS 사용자 디렉토리
+        'lambda_function.py',  # 람다 함수 파일
+        'main.py',             # 메인 파일
+        'app.py',              # 앱 파일
+    ]
+    
+    # 명시적 사용자 패턴 확인
+    for pattern in user_patterns:
+        if pattern in filename:
+            print(f"[USER-FILTER] ✅ User file (pattern match): {basename}")
+            return True
+    
+    # 🚫 시스템/런타임 파일 패턴들 (이게 있으면 무조건 시스템 파일)
+    system_patterns = [
+        # Python 런타임 및 표준 라이브러리
+        '/usr/lib/python',
+        '/usr/local/lib/python',
+        'site-packages',
+        'dist-packages',
+        
+        # 디버거 관련
+        'pydevd',
+        'debugpy',
+        '_pydev',
+        
+        # AWS Lambda 런타임
+        '/var/runtime/',
+        '/opt/python/',
+        
+        # 임시/내부 파일들
+        '<string>',
+        '<stdin>',
+        '<console>',
+        '<frozen',
+        
+        # 기타 시스템 경로들
+        '/lib/python',
+        '/Library/Frameworks/Python',
+        'importlib',
+        'runpy.py',
+        'threading.py',
+        'queue.py',
+        'bootstrap',
+        'runtime',
+    ]
+    
+    # 시스템 패턴 확인
+    for pattern in system_patterns:
+        if pattern in filename_lower:
+            print(f"[USER-FILTER] 🚫 System file: {basename}")
+            return False
+    
+    # 🔍 .py 확장자 파일은 기본적으로 사용자 파일로 간주
+    if filename.endswith('.py'):
+        # 단, 파일명이 시스템적인 경우는 제외
+        system_filenames = [
+            '__init__.py',
+            'setup.py',
+            'conftest.py',
+            'test_',
+            '_test',
+            'tests.py'
+        ]
+        
+        for sys_name in system_filenames:
+            if sys_name in basename.lower():
+                print(f"[USER-FILTER] 🚫 System-like Python file: {basename}")
+                return False
+        
+        print(f"[USER-FILTER] ✅ User Python file: {basename}")
+        return True
+    
+    # 🚫 기타는 시스템 파일로 간주
+    print(f"[USER-FILTER] 🚫 Non-Python file: {basename}")
+    return False
+
+def create_empty_session_data(thread_id):
+    """빈 callstack 세션 데이터 구조 생성"""
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "thread_id": thread_id,
+        "extraction_method": "lambda_debugger_callstack_array",
+        "callstacks": [],  # 빈 배열로 시작, frame_id별로 추가됨
+        "summary": {
+            "total_frames": 0,
+            "total_variables": 0,
+            "frames_with_both_scopes": 0,
+            "callstack_complete": False
+        },
+        "debug_info": {
+            "session_created": datetime.now().isoformat(),
+            "callstack_mode": True,
+            "note": "Each index in callstacks array represents depth (0=bottom/current)"
+        }
+    }
+
+def extract_frame_info_improved(py_db, thread_id, variables_reference):
+    """프레임 정보 추출 (람다 환경 최적화) - 객체 변경 시 라인 정보 보강"""
+    try:
+        print(f"[LAMBDA-DEBUG] Extracting frame info for {variables_reference}")
+        
+        # 방법 1: py_db.find_frame() 
+        try:
+            frame = py_db.find_frame(thread_id, variables_reference)
+            if frame is not None:
+                filename = frame.f_code.co_filename
+                lineno = frame.f_lineno
+                function_name = frame.f_code.co_name
+                
+                try:
+                    import linecache
+                    line_text = linecache.getline(filename, lineno)
+                    code = line_text.strip() if line_text else "# Code not available"
+                except Exception:
+                    code = "# Code extraction failed"
+                
+                print(f"[LAMBDA-DEBUG] ✅ Method 1 success: {filename}:{lineno}")
+                return {
+                    "frame_id": variables_reference,
+                    "file": os.path.basename(filename),
+                    "full_file": filename,
+                    "line": lineno,
+                    "function": function_name,
+                    "code": code,
+                    "extraction_method": "find_frame"
+                }
+        except Exception as e:
+            print(f"[LAMBDA-DEBUG] find_frame failed: {e}")
+        
+        # 방법 2: frames_list 직접 접근 (🔧 FramesList 객체 처리 개선)
+        try:
+            actual_thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+            if actual_thread_id and hasattr(py_db.suspended_frames_manager, 'get_frames_list'):
+                frames_list = py_db.suspended_frames_manager.get_frames_list(actual_thread_id)
+                
+                if frames_list:
+                    print(f"[LAMBDA-DEBUG] frames_list type: {type(frames_list)}")
+                    
+                    # 🔧 FramesList 객체 처리 개선
+                    frames_to_check = []
+                    if hasattr(frames_list, '__iter__'):
+                        # 반복 가능한 객체인 경우
+                        try:
+                            frames_to_check = list(frames_list)[:3]
+                        except Exception:
+                            # 리스트 변환 실패 시 직접 반복
+                            count = 0
+                            for frame_data in frames_list:
+                                frames_to_check.append(frame_data)
+                                count += 1
+                                if count >= 3:
+                                    break
+                    
+                    for frame_data in frames_to_check:
+                        try:
+                            if isinstance(frame_data, (tuple, list)) and len(frame_data) >= 6:
+                                f_id, frame_obj, method_name, original_filename, filename_in_utf8, lineno = frame_data[:6]
+                                
+                                if f_id == variables_reference:
+                                    # 실시간 정보 우선
+                                    if hasattr(frame_obj, 'f_lineno'):
+                                        current_filename = frame_obj.f_code.co_filename
+                                        current_lineno = frame_obj.f_lineno
+                                        current_function = frame_obj.f_code.co_name
+                                    else:
+                                        current_filename = filename_in_utf8 or original_filename
+                                        current_lineno = lineno
+                                        current_function = method_name
+                                    
+                                    import linecache
+                                    line_text = linecache.getline(current_filename, current_lineno)
+                                    code = line_text.strip() if line_text else "# Code not available"
+                                    
+                                    print(f"[LAMBDA-DEBUG] ✅ Method 2 success: {current_filename}:{current_lineno}")
+                                    return {
+                                        "frame_id": variables_reference,
+                                        "file": os.path.basename(current_filename),
+                                        "full_file": current_filename,
+                                        "line": current_lineno,
+                                        "function": current_function,
+                                        "code": code,
+                                        "extraction_method": "frames_list"
+                                    }
+                        except Exception:
+                            continue
+        except Exception as e:
+            print(f"[LAMBDA-DEBUG] frames_list failed: {e}")
+        
+        # 🚀 방법 2.5: 객체 변수의 경우 부모 프레임 정보 활용
+        try:
+            if is_object_variable(py_db, variables_reference, thread_id):
+                print(f"[LAMBDA-DEBUG] Attempting method 2.5: parent frame lookup...")
+                
+                # 부모 프레임 정보 찾기
+                parent_frame_info = None
+                try:
+                    # 같은 스레드의 다른 프레임들 확인
+                    actual_thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+                    if actual_thread_id:
+                        # 최근에 성공한 프레임 정보 재사용
+                        frames_list = py_db.suspended_frames_manager.get_frames_list(actual_thread_id)
+                        if frames_list:
+                            frames_to_check = []
+                            if hasattr(frames_list, '__iter__'):
+                                try:
+                                    frames_to_check = list(frames_list)
+                                except Exception:
+                                    count = 0
+                                    for frame_data in frames_list:
+                                        frames_to_check.append(frame_data)
+                                        count += 1
+                                        if count >= 5:  # 더 많은 프레임 확인
+                                            break
+                            
+                            for frame_data in frames_to_check:
+                                try:
+                                    if isinstance(frame_data, (tuple, list)) and len(frame_data) >= 6:
+                                        f_id, frame_obj, method_name, original_filename, filename_in_utf8, lineno = frame_data[:6]
+                                        
+                                        # 유효한 프레임 정보가 있는 경우
+                                        if (hasattr(frame_obj, 'f_lineno') and 
+                                            original_filename and 
+                                            original_filename.endswith('.py') and
+                                            not any(pattern in original_filename.lower() for pattern in 
+                                                   ['pydevd', 'debugpy', '_pydev', 'site-packages'])):
+                                            
+                                            parent_frame_info = {
+                                                "filename": frame_obj.f_code.co_filename,
+                                                "lineno": frame_obj.f_lineno,
+                                                "function": frame_obj.f_code.co_name
+                                            }
+                                            break
+                                except Exception:
+                                    continue
+                except Exception:
+                    pass
+                
+                if parent_frame_info:
+                    import linecache
+                    line_text = linecache.getline(parent_frame_info["filename"], parent_frame_info["lineno"])
+                    code = line_text.strip() if line_text else "# Code not available"
+                    
+                    print(f"[LAMBDA-DEBUG] ✅ Method 2.5 success: {parent_frame_info['filename']}:{parent_frame_info['lineno']}")
+                    return {
+                        "frame_id": variables_reference,
+                        "file": os.path.basename(parent_frame_info["filename"]),
+                        "full_file": parent_frame_info["filename"],
+                        "line": parent_frame_info["lineno"],
+                        "function": parent_frame_info["function"],
+                        "code": code,
+                        "extraction_method": "parent_frame_lookup"
+                    }
+            else:
+                print(f"[LAMBDA-DEBUG] Not an object variable, skipping parent frame lookup")
+        except Exception as e:
+            print(f"[LAMBDA-DEBUG] Method 2.5 failed: {e}")
+        
+        # 🚀 방법 3: 현재 실행 중인 스레드의 frame 추적
+        try:
+            print(f"[LAMBDA-DEBUG] Attempting method 3: current thread frame tracking...")
+            
+            # 현재 실행 중인 모든 프레임 탐색
+            import sys
+            import threading
+            
+            current_tid = threading.current_thread().ident
+            current_frames = sys._current_frames()
+            
+            # 현재 스레드의 프레임 스택 순회
+            frame = current_frames.get(current_tid)
+            frame_depth = 0
+            
+            while frame and frame_depth < 10:  # 최대 10개 프레임까지 탐색
+                try:
+                    filename = frame.f_code.co_filename
+                    lineno = frame.f_lineno
+                    function_name = frame.f_code.co_name
+                    
+                    # 사용자 코드 필터링 (디버거 코드 제외)
+                    if not any(pattern in filename.lower() for pattern in 
+                              ['pydevd', 'debugpy', '_pydev', 'site-packages']):
+                        
+                        # .py 파일이고 유효한 라인 번호를 가진 경우
+                        if filename.endswith('.py') and lineno > 0:
+                            
+                            import linecache
+                            line_text = linecache.getline(filename, lineno)
+                            code = line_text.strip() if line_text else "# Code not available"
+                            
+                            print(f"[LAMBDA-DEBUG] ✅ Method 3 success! Found user frame:")
+                            print(f"[LAMBDA-DEBUG]   File: {filename}")
+                            print(f"[LAMBDA-DEBUG]   Line: {lineno}")
+                            print(f"[LAMBDA-DEBUG]   Function: {function_name}")
+                            print(f"[LAMBDA-DEBUG]   Code: {code[:50]}...")
+                            
+                            return {
+                                "frame_id": variables_reference,
+                                "file": os.path.basename(filename),
+                                "full_file": filename,
+                                "line": lineno,
+                                "function": function_name,
+                                "code": code,
+                                "extraction_method": "current_thread_frame_tracking"
+                            }
+                    
+                    frame = frame.f_back
+                    frame_depth += 1
+                    
+                except Exception as frame_error:
+                    print(f"[LAMBDA-DEBUG] Frame processing error: {frame_error}")
+                    frame = frame.f_back
+                    frame_depth += 1
+                    continue
+            
+            print(f"[LAMBDA-DEBUG] Method 3: No valid user frame found in {frame_depth} frames")
+            
+        except Exception as e:
+            print(f"[LAMBDA-DEBUG] Method 3 failed: {e}")
+        
+        # 🚀 방법 4: traceback 기반 정보 추출 (최후 수단)
+        try:
+            print(f"[LAMBDA-DEBUG] Attempting method 4: traceback-based extraction...")
+            
+            import traceback
+            import threading
+            
+            current_tid = threading.current_thread().ident
+            current_frames = sys._current_frames()
+            frame = current_frames.get(current_tid)
+            
+            if frame:
+                # traceback.format_stack으로 스택 정보 추출
+                stack = traceback.format_stack(frame)
+                
+                # 스택에서 사용자 코드 찾기
+                for entry in reversed(stack[-5:]):  # 최근 5개 엔트리만 확인
+                    try:
+                        lines = entry.strip().split('\n')
+                        if len(lines) >= 2:
+                            location_line = lines[0].strip()
+                            code_line = lines[1].strip()
+                            
+                            # 파일 정보 파싱
+                            if '"' in location_line and 'line ' in location_line:
+                                parts = location_line.split(', ')
+                                if len(parts) >= 3:
+                                    # 파일 경로 추출
+                                    file_part = parts[0].strip()
+                                    if '"' in file_part:
+                                        filename = file_part.split('"')[1]
+                                        
+                                        # 사용자 코드 필터링
+                                        if (filename.endswith('.py') and 
+                                            not any(pattern in filename.lower() for pattern in 
+                                                   ['pydevd', 'debugpy', '_pydev', 'site-packages'])):
+                                            
+                                            # 라인 번호 추출
+                                            line_part = parts[1].strip()
+                                            if 'line ' in line_part:
+                                                try:
+                                                    lineno = int(line_part.replace('line ', ''))
+                                                except ValueError:
+                                                    continue
+                                            
+                                            # 함수명 추출
+                                            func_part = parts[2].strip()
+                                            if 'in ' in func_part:
+                                                function_name = func_part.replace('in ', '')
+                                            else:
+                                                function_name = "unknown"
+                                            
+                                            print(f"[LAMBDA-DEBUG] ✅ Method 4 success! Found from traceback:")
+                                            print(f"[LAMBDA-DEBUG]   File: {filename}")
+                                            print(f"[LAMBDA-DEBUG]   Line: {lineno}")
+                                            print(f"[LAMBDA-DEBUG]   Function: {function_name}")
+                                            print(f"[LAMBDA-DEBUG]   Code: {code_line}")
+                                            
+                                            return {
+                                                "frame_id": variables_reference,
+                                                "file": os.path.basename(filename),
+                                                "full_file": filename,
+                                                "line": lineno,
+                                                "function": function_name,
+                                                "code": code_line,
+                                                "extraction_method": "traceback_based"
+                                            }
+                    except Exception as parse_error:
+                        print(f"[LAMBDA-DEBUG] Traceback parsing error: {parse_error}")
+                        continue
+            
+            print(f"[LAMBDA-DEBUG] Method 4: No valid traceback entry found")
+            
+        except Exception as e:
+            print(f"[LAMBDA-DEBUG] Method 4 failed: {e}")
+        
+        
+        ############## 그냥 무조건 -1로
+        # 🚀 개선된 기본 반환값 (최소한 .py 확장자는 보장)
+        print(f"[LAMBDA-DEBUG] All methods failed, using enhanced fallback...")
+        
+        # 현재 실행 중인 파일 정보라도 가져오기 시도
+        fallback_file = "lambda_function.py"  # ✅ .py 확장자 추가
+        fallback_line = -1
+        fallback_function = "lambda_handler"
+        
+        try:
+            # 현재 스택에서 첫 번째 사용자 파일이라도 찾기
+            import sys
+            import threading
+            current_frames = sys._current_frames()
+            frame = current_frames.get(threading.current_thread().ident)
+            
+            while frame:
+                filename = frame.f_code.co_filename
+                if (filename.endswith('.py') and 
+                    not any(pattern in filename.lower() for pattern in 
+                           ['pydevd', 'debugpy', '_pydev', 'site-packages'])):
+                    fallback_file = os.path.basename(filename)
+                    fallback_line = -1
+                    fallback_function = frame.f_code.co_name
+                    print(f"[LAMBDA-DEBUG] Enhanced fallback found: {fallback_file}:{fallback_line}")
+                    break
+                frame = frame.f_back
+        except Exception as fallback_error:
+            print(f"[LAMBDA-DEBUG] Enhanced fallback failed: {fallback_error}")
+        
+        return {
+            "frame_id": variables_reference,
+            "file": fallback_file,  # ✅ .py 확장자 포함
+            "full_file": f"/tmp/{fallback_file}",
+            "line": fallback_line,  # ✅ jump to 가능한 라인
+            "function": fallback_function,
+            "code": "# Frame info extraction failed - using enhanced fallback",
+            "extraction_method": "enhanced_fallback"
+        }
+        
+    except Exception as e:
+        print(f"[LAMBDA-DEBUG] Critical error: {e}")
+        return {
+            "frame_id": variables_reference,
+            "file": "lambda_function.py",  # ✅ .py 확장자 보장
+            "full_file": "/tmp/lambda_function.py",
+            "line": -1,  # 
+            "function": "unknown",
+            "code": f"# Critical error: {str(e)}",
+            "extraction_method": "error_fallback"
+        }
+
+    
+def is_object_variable(py_db, variables_reference, thread_id):
+    """객체 변수인지 정확히 판별하는 함수"""
+    try:
+        # 1. 기본 조건: variables_reference가 thread_id와 다름
+        if variables_reference == thread_id:
+            return False
+        
+        # 2. Variable 타입 확인
+        variable = py_db.suspended_frames_manager.get_variable(variables_reference)
+        variable_type = type(variable).__name__
+        
+        if variable_type == "_ObjectVariable":
+            return True
+        elif variable_type == "_FrameVariable":
+            return False
+        
+        # 3. Frame 추출 가능 여부로 판별
+        frame = py_db.find_frame(thread_id, variables_reference)
+        if frame is not None:
+            # frame을 직접 찾을 수 있다면 Frame variable
+            return False
+        
+        # 4. frames_list에서 frame_id로 존재하는지 확인
+        actual_thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+        if actual_thread_id:
+            frames_list = py_db.suspended_frames_manager.get_frames_list(actual_thread_id)
+            if frames_list:
+                for frame_data in frames_list:
+                    if isinstance(frame_data, (tuple, list)) and len(frame_data) >= 1:
+                        f_id = frame_data[0]
+                        if f_id == variables_reference:
+                            # frames_list에 직접 존재한다면 Frame variable
+                            return False
+        
+        # 5. 위 조건들을 통과했다면 Object variable일 가능성이 높음
+        return True
+        
+    except Exception as e:
+        print(f"[DEBUG] Error determining variable type: {e}")
+        # 에러 시 안전하게 False 반환
+        return False
+
+# def collect_recursive_children(py_db, var_data, current_depth=0, processed_refs=None, parent_type=None):
+#     """
+#     제한을 제거하고 스마트 필터링을 적용한 재귀적 자식 수집
+#     """
+#     if processed_refs is None:
+#         processed_refs = set()
+    
+#     # 기본 변수 정보 복사
+#     enhanced_var = var_data.copy()
+#     enhanced_var["recursive_children"] = []
+#     enhanced_var["recursive_depth"] = current_depth
+#     enhanced_var["recursive_collection_time"] = datetime.now().isoformat()
+    
+#     variables_reference = var_data.get("variablesReference", 0)
+#     var_name = var_data.get("name", "")
+#     var_type = var_data.get("type", "")
+#     var_value = str(var_data.get("value", ""))
+    
+#     # 재귀 종료 조건 (제한 완화)
+#     max_reasonable_depth = 10  # 기존 3에서 10으로 증가
+    
+#     if (current_depth >= max_reasonable_depth or 
+#         variables_reference == 0 or 
+#         variables_reference in processed_refs):
+        
+#         if current_depth >= max_reasonable_depth:
+#             enhanced_var["recursive_truncated"] = f"max_depth_reached_{max_reasonable_depth}"
+#         elif variables_reference == 0:
+#             enhanced_var["recursive_truncated"] = "no_children"
+#         elif variables_reference in processed_refs:
+#             enhanced_var["recursive_truncated"] = "circular_reference"
+        
+#         return enhanced_var
+    
+#     # 순환 참조 방지
+#     processed_refs.add(variables_reference)
+    
+#     try:
+#         # SuspendedFramesManager를 통해 자식 변수들 가져오기
+#         sfm = py_db.suspended_frames_manager
+#         frames_tracker = sfm._get_tracker_for_variable_reference(variables_reference)
+        
+#         if frames_tracker is not None:
+#             variable = frames_tracker.get_variable(variables_reference)
+#             children = variable.get_children_variables()
+            
+#             print(f"[FILTER-DEBUG] Depth {current_depth}: {var_name} ({var_type}) has {len(children)} children")
+            
+#             # 필터링된 자식들만 처리
+#             filtered_children = []
+#             for i, child_var in enumerate(children):
+#                 try:
+#                     child_data = child_var.get_var_data()
+#                     child_name = child_data.get("name", "")
+#                     child_type = child_data.get("type", "")
+#                     child_value = str(child_data.get("value", ""))
+                    
+#                     # 기본 필터링
+#                     if should_filter_special_variable(child_name, child_type, child_value):
+#                         continue
+                    
+#                     # 컨텍스트 기반 필터링
+#                     if should_filter_by_context(child_name, child_type, child_value, current_depth, var_type):
+#                         continue
+                    
+#                     filtered_children.append(child_var)
+                    
+#                 except Exception as child_error:
+#                     print(f"[FILTER-ERROR] Error checking child {i}: {child_error}")
+#                     continue
+            
+#             print(f"[FILTER-DEBUG] Filtered {len(children)} -> {len(filtered_children)} children for {var_name}")
+            
+#             # 필터링된 자식들을 재귀적으로 처리
+#             for i, child_var in enumerate(filtered_children):
+#                 try:
+#                     child_data = child_var.get_var_data()
+                    
+#                     # 🔥 재귀 호출 (올바른 매개변수 순서)
+#                     recursive_child = collect_recursive_children(
+#                         py_db, child_data, current_depth + 1, processed_refs.copy(), var_type
+#                     )
+                    
+#                     enhanced_var["recursive_children"].append(recursive_child)
+                    
+#                 except Exception as child_error:
+#                     error_child = {
+#                         "name": f"<error_child_{i}>",
+#                         "value": str(child_error)[:100],
+#                         "type": "<error>",
+#                         "variablesReference": 0,
+#                         "recursive_children": [],
+#                         "recursive_depth": current_depth + 1,
+#                         "error": str(child_error)
+#                     }
+#                     enhanced_var["recursive_children"].append(error_child)
+            
+#             # 자식 통계 추가
+#             enhanced_var["recursive_stats"] = {
+#                 "original_children": len(children),
+#                 "filtered_children": len(filtered_children),
+#                 "displayed_children": len(enhanced_var["recursive_children"]),
+#                 "filter_ratio": f"{len(filtered_children)}/{len(children)}" if len(children) > 0 else "0/0"
+#             }
+                
+#     except Exception as e:
+#         enhanced_var["recursive_error"] = str(e)
+#         enhanced_var["recursive_children"] = []
+    
+#     # processed_refs에서 제거
+#     processed_refs.discard(variables_reference)
+    
+#     return enhanced_var
+def collect_recursive_children(py_db, var_data, current_depth=0, processed_refs=None, parent_type=None):
+    """
+    제한을 제거하고 스마트 필터링을 적용한 재귀적 자식 수집
+    """
+    if processed_refs is None:
+        processed_refs = set()
+    
+    # 기본 변수 정보 복사
+    enhanced_var = var_data.copy()
+    enhanced_var["recursive_children"] = []
+    enhanced_var["recursive_depth"] = current_depth
+    enhanced_var["recursive_collection_time"] = datetime.now().isoformat()
+    
+    variables_reference = var_data.get("variablesReference", 0)
+    var_name = var_data.get("name", "")
+    var_type = var_data.get("type", "")
+    var_value = str(var_data.get("value", ""))
+    
+    # 재귀 종료 조건 (depth 제한 완전 제거)
+    if (variables_reference == 0 or 
+        variables_reference in processed_refs):
+        
+        if variables_reference == 0:
+            enhanced_var["recursive_truncated"] = "no_children"
+        elif variables_reference in processed_refs:
+            enhanced_var["recursive_truncated"] = "circular_reference"
+        
+        return enhanced_var
+    
+    # 순환 참조 방지
+    processed_refs.add(variables_reference)
+    
+    try:
+        # SuspendedFramesManager를 통해 자식 변수들 가져오기
+        sfm = py_db.suspended_frames_manager
+        frames_tracker = sfm._get_tracker_for_variable_reference(variables_reference)
+        
+        if frames_tracker is not None:
+            variable = frames_tracker.get_variable(variables_reference)
+            children = variable.get_children_variables()
+            
+            # print(f"[FILTER-DEBUG] Depth {current_depth}: {var_name} ({var_type}) has {len(children)} children")
+            
+            # 필터링된 자식들만 처리
+            filtered_children = []
+            for i, child_var in enumerate(children):
+                try:
+                    child_data = child_var.get_var_data()
+                    child_name = child_data.get("name", "")
+                    child_type = child_data.get("type", "")
+                    child_value = str(child_data.get("value", ""))
+                    
+                    # 기본 필터링
+                    if should_filter_special_variable(child_name, child_type, child_value):
+                        continue
+                    
+                    # 컨텍스트 기반 필터링
+                    if should_filter_by_context(child_name, child_type, child_value, current_depth, var_type):
+                        continue
+                    
+                    filtered_children.append(child_var)
+                    
+                except Exception as child_error:
+                    print(f"[FILTER-ERROR] Error checking child {i}: {child_error}")
+                    continue
+            
+            # print(f"[FILTER-DEBUG] Filtered {len(children)} -> {len(filtered_children)} children for {var_name}")
+            
+            # 필터링된 자식들을 재귀적으로 처리
+            for i, child_var in enumerate(filtered_children):
+                try:
+                    child_data = child_var.get_var_data()
+                    
+                    # 🔥 재귀 호출 (올바른 매개변수 순서)
+                    recursive_child = collect_recursive_children(
+                        py_db, child_data, current_depth + 1, processed_refs.copy(), var_type
+                    )
+                    
+                    enhanced_var["recursive_children"].append(recursive_child)
+                    
+                except Exception as child_error:
+                    error_child = {
+                        "name": f"<error_child_{i}>",
+                        "value": str(child_error)[:100],
+                        "type": "<error>",
+                        "variablesReference": 0,
+                        "recursive_children": [],
+                        "recursive_depth": current_depth + 1,
+                        "error": str(child_error)
+                    }
+                    enhanced_var["recursive_children"].append(error_child)
+            
+            # 자식 통계 추가
+            enhanced_var["recursive_stats"] = {
+                "original_children": len(children),
+                "filtered_children": len(filtered_children),
+                "displayed_children": len(enhanced_var["recursive_children"]),
+                "filter_ratio": f"{len(filtered_children)}/{len(children)}" if len(children) > 0 else "0/0"
+            }
+                
+    except Exception as e:
+        enhanced_var["recursive_error"] = str(e)
+        enhanced_var["recursive_children"] = []
+    
+    # processed_refs에서 제거
+    processed_refs.discard(variables_reference)
+    
+    return enhanced_var
+
+def calculate_recursive_stats(variables_with_children):
+    """재귀적 수집 통계 계산"""
+    total_nodes = 0
+    max_depth = 0
+    variables_with_children_count = 0
+    
+    def count_nodes(var):
+        nonlocal total_nodes, max_depth
+        total_nodes += 1
+        current_depth = var.get("recursive_depth", 0)
+        max_depth = max(max_depth, current_depth)
+        
+        for child in var.get("recursive_children", []):
+            count_nodes(child)
+    
+    for var in variables_with_children:
+        if var.get("recursive_children"):
+            variables_with_children_count += 1
+        count_nodes(var)
+    
+    return {
+        "total_variables": len(variables_with_children),
+        "variables_with_children": variables_with_children_count,
+        "total_nodes_collected": total_nodes,
+        "max_recursive_depth": max_depth,
+        "collection_timestamp": datetime.now().isoformat()
+    }
 
 class InternalGetVariable(InternalThreadCommand):
     """gets the value of a variable"""
@@ -886,6 +2845,8 @@ class InternalGetArray(InternalThreadCommand):
 def internal_change_variable(dbg, seq, thread_id, frame_id, scope, attr, value):
     """Changes the value of a variable"""
     try:
+        # Log function call and arguments
+        print(f"internal_change_variable called with: dbg={dbg}, seq={seq}, thread_id={thread_id}, frame_id={frame_id}, scope={scope}, attr='{attr}', value='{value}'")
         frame = dbg.find_frame(thread_id, frame_id)
         if frame is not None:
             result = pydevd_vars.change_attr_expression(frame, attr, value, dbg)
@@ -914,10 +2875,20 @@ def internal_change_variable_json(py_db, request):
     # : :type arguments: SetVariableArguments
     arguments = request.arguments
     variables_reference = arguments.variablesReference
+    variable_name = arguments.name
+    new_value = arguments.value
+    
+    print(f"[CHANGE-DEBUG] 🔧 변수 변경 요청:")
+    print(f"[CHANGE-DEBUG]   name: '{variable_name}'")
+    print(f"[CHANGE-DEBUG]   value: '{new_value}'")
+    print(f"[CHANGE-DEBUG]   variables_reference: {variables_reference}")
+    
     scope = None
+    original_variables_reference = variables_reference
     if isinstance_checked(variables_reference, ScopeRequest):
         scope = variables_reference
         variables_reference = variables_reference.variable_reference
+        print(f"[CHANGE-DEBUG]   scope: {scope.scope if scope else None}")
 
     fmt = arguments.format
     if hasattr(fmt, "to_dict"):
@@ -925,39 +2896,401 @@ def internal_change_variable_json(py_db, request):
 
     try:
         variable = py_db.suspended_frames_manager.get_variable(variables_reference)
+        print(f"[CHANGE-DEBUG] ✅ Variable container found: {type(variable).__name__}")
     except KeyError:
         variable = None
+        print(f"[CHANGE-DEBUG] ❌ Variable container not found: KeyError")
 
     if variable is None:
+        print(f"[CHANGE-DEBUG] ❌ Writing error response: variable container not found")
         _write_variable_response(
-            py_db, request, value="", success=False, message="Unable to find variable container to change: %s." % (variables_reference,)
+            py_db, request, value="", success=False, 
+            message="Unable to find variable container to change: %s." % (variables_reference,)
         )
         return
 
-    child_var = variable.change_variable(arguments.name, arguments.value, py_db, fmt=fmt, scope=scope)
+    # 🔍 변경 전 현재 값 확인
+    try:
+        current_var_data = variable.get_var_data(fmt=fmt)
+        current_value = current_var_data.get("value", "N/A")
+        print(f"[CHANGE-DEBUG] 📊 Current value before change: '{current_value}'")
+    except Exception as e:
+        print(f"[CHANGE-DEBUG] ⚠️ Could not get current value: {e}")
+        current_value = "unknown"
 
-    if child_var is None:
-        _write_variable_response(py_db, request, value="", success=False, message="Unable to change: %s." % (arguments.name,))
+    print(f"[CHANGE-DEBUG] 🔄 Attempting to change variable...")
+    
+    # 🚀 핵심 개선: 다단계 변수 변경 시도
+    child_var = None
+    success = False
+    final_var_data = None
+    
+    # 방법 1: 기존 change_variable 시도
+    try:
+        child_var = variable.change_variable(variable_name, new_value, py_db, fmt=fmt, scope=scope)
+        
+        if child_var is not None:
+            # 변경 후 값 즉시 확인
+            test_data = child_var.get_var_data(fmt=fmt)
+            actual_new_value = test_data.get("value", "")
+            
+            print(f"[CHANGE-DEBUG] 📊 Value after change_variable: '{actual_new_value}'")
+            
+            # 🔍 변경이 실제로 적용되었는지 검증
+            if str(actual_new_value) == str(new_value):
+                success = True
+                final_var_data = test_data
+                print(f"[CHANGE-DEBUG] ✅ change_variable successful: '{current_value}' → '{actual_new_value}'")
+            else:
+                print(f"[CHANGE-DEBUG] ⚠️ change_variable may have failed: expected '{new_value}', got '{actual_new_value}'")
+                child_var = None  # 재시도를 위해 None으로 설정
+        else:
+            print(f"[CHANGE-DEBUG] ❌ change_variable returned None")
+    
+    except Exception as change_error:
+        print(f"[CHANGE-DEBUG] ❌ change_variable failed with exception: {change_error}")
+        child_var = None
+
+    # 방법 2: 직접 프레임 레벨 변경 시도 (change_variable 실패 시)
+    if not success and child_var is None:
+        print(f"[CHANGE-DEBUG] 🔧 Attempting direct frame-level change...")
+        
+        try:
+            # 스레드 및 프레임 ID 확인
+            thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+            
+            if thread_id:
+                frame = py_db.find_frame(thread_id, variables_reference)
+                
+                if frame is not None:
+                    print(f"[CHANGE-DEBUG] 🎯 Frame found, attempting direct change...")
+                    
+                    # 값을 안전하게 평가
+                    try:
+                        # 문자열인 경우 따옴표 처리
+                        if isinstance(new_value, str) and not new_value.startswith(("'", '"')):
+                            # 숫자나 불린 값인지 확인
+                            try:
+                                # 정수 시도
+                                evaluated_value = int(new_value)
+                            except ValueError:
+                                try:
+                                    # 실수 시도
+                                    evaluated_value = float(new_value)
+                                except ValueError:
+                                    # 불린 시도
+                                    if new_value.lower() in ('true', 'false'):
+                                        evaluated_value = new_value.lower() == 'true'
+                                    else:
+                                        # 문자열로 처리
+                                        evaluated_value = new_value
+                        else:
+                            # eval을 사용하여 평가 (안전한 컨텍스트에서)
+                            evaluated_value = eval(new_value, frame.f_globals, frame.f_locals)
+                        
+                        print(f"[CHANGE-DEBUG] 🔄 Evaluated value: {evaluated_value} (type: {type(evaluated_value).__name__})")
+                        
+                        # Scope에 따라 적절한 namespace에 값 설정
+                        if scope and hasattr(scope, 'scope') and scope.scope == "globals":
+                            frame.f_globals[variable_name] = evaluated_value
+                            verification_value = frame.f_globals.get(variable_name)
+                            print(f"[CHANGE-DEBUG] 🔧 Direct globals change applied")
+                        else:
+                            exec(f"{variable_name} = {repr(evaluated_value)}", frame.f_globals, frame.f_locals)
+                            verification_value = frame.f_locals.get(variable_name)
+                            print(f"[CHANGE-DEBUG] 🔧 Direct locals change applied")
+                        
+                        print(f"[CHANGE-DEBUG] 📊 Verification value: '{verification_value}'")
+                        
+                        # 변경 성공 확인
+                        if str(verification_value) == str(evaluated_value):
+                            success = True
+                            print(f"[CHANGE-DEBUG] ✅ Direct change successful!")
+                            
+                            # final_var_data 직접 생성
+                            final_var_data = {
+                                "value": str(verification_value),
+                                "type": type(verification_value).__name__,
+                                "variablesReference": 0
+                            }
+                            
+                            # Mock child_var 생성
+                            class MockChildVar:
+                                def get_var_data(self, fmt=None):
+                                    return final_var_data
+                            
+                            child_var = MockChildVar()
+                        else:
+                            print(f"[CHANGE-DEBUG] ❌ Direct change verification failed")
+                            
+                    except Exception as eval_error:
+                        print(f"[CHANGE-DEBUG] ❌ Value evaluation failed: {eval_error}")
+                        
+                else:
+                    print(f"[CHANGE-DEBUG] ❌ Frame not found for direct change")
+            else:
+                print(f"[CHANGE-DEBUG] ❌ Thread ID not found for direct change")
+                
+        except Exception as direct_error:
+            print(f"[CHANGE-DEBUG] ❌ Direct change failed: {direct_error}")
+
+    # 🚨 모든 방법 실패 시 오류 응답
+    if not success or child_var is None:
+        print(f"[CHANGE-DEBUG] ❌ All change methods failed")
+        _write_variable_response(
+            py_db, request, value="", success=False, 
+            message="Unable to change: %s." % (variable_name,)
+        )
         return
 
-    var_data = child_var.get_var_data(fmt=fmt)
-    body = SetVariableResponseBody(
-        value=var_data["value"],
-        type=var_data["type"],
-        variablesReference=var_data.get("variablesReference"),
-        namedVariables=var_data.get("namedVariables"),
-        indexedVariables=var_data.get("indexedVariables"),
-    )
+    # ✅ 성공 시 응답 생성
+    print(f"[CHANGE-DEBUG] ✅ change_variable returned: {type(child_var).__name__}")
+    
+    # 최종 변수 데이터 가져오기
+    if final_var_data is None:
+        try:
+            final_var_data = child_var.get_var_data(fmt=fmt)
+        except Exception as data_error:
+            print(f"[CHANGE-DEBUG] ❌ get_var_data failed: {data_error}")
+            _write_variable_response(
+                py_db, request, value="", success=False,
+                message="Failed to get updated variable data: %s" % str(data_error)
+            )
+            return
+    
+    print(f"[CHANGE-DEBUG] 📊 Getting updated variable data...")
+    print(f"[CHANGE-DEBUG] ✅ var_data retrieved:")
+    print(f"[CHANGE-DEBUG]   value: '{final_var_data.get('value', 'N/A')}'")
+    print(f"[CHANGE-DEBUG]   type: '{final_var_data.get('type', 'N/A')}'")
+    print(f"[CHANGE-DEBUG]   variablesReference: {final_var_data.get('variablesReference', 0)}")
+    
+    # 🚀 UI 새로고침을 위한 응답 구조
+    print(f"[CHANGE-DEBUG] 🔄 Applying container-specific UI refresh...")
+    
+    response_value = final_var_data.get("value", "")
+    response_type = final_var_data.get("type") or "unknown"  # null 방지
+    response_ref = final_var_data.get("variablesReference", 0)
+    
+    body_kwargs = {
+        "value": str(response_value),
+        "type": response_type,
+        "variablesReference": response_ref,
+    }
+    
+    # 선택적 필드들 추가
+    if final_var_data.get("namedVariables") is not None:
+        body_kwargs["namedVariables"] = final_var_data["namedVariables"]
+    if final_var_data.get("indexedVariables") is not None:
+        body_kwargs["indexedVariables"] = final_var_data["indexedVariables"]
+    
+    body = SetVariableResponseBody(**body_kwargs)
+    
+    print(f"[CHANGE-DEBUG] 📤 Creating container-optimized response...")
     variables_response = pydevd_base_schema.build_response(request, kwargs={"body": body})
+    
+    # 표준 응답 전송
     py_db.writer.add_command(NetCommand(CMD_RETURN, 0, variables_response, is_json=True))
+    
+    # 🚀 UI 새로고침 이벤트 전송 (핵심!)
+    try:
+        thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+        if thread_id:
+            # Variables 창 무효화 이벤트
+            invalidate_event = {
+                "type": "event",
+                "event": "invalidated",
+                "body": {
+                    "areas": ["variables"],
+                    "threadId": thread_id,
+                    "stackFrameId": variables_reference
+                }
+            }
+            py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+            print(f"[UI-REFRESH] 🔄 Variables invalidation event sent for thread {thread_id}")
+            
+            # Console 알림 이벤트
+            output_event = {
+                "type": "event",
+                "event": "output",
+                "body": {
+                    "category": "console",
+                    "output": f"✅ {variable_name} = {response_value}\n"
+                }
+            }
+            py_db.writer.add_command(NetCommand(CMD_RETURN, 0, output_event, is_json=True))
+            print(f"[UI-REFRESH] 📢 Output notification sent: {variable_name} = {response_value}")
+            
+        else:
+            print(f"[UI-REFRESH] ⚠️ No thread_id found for UI refresh")
+            
+    except Exception as refresh_error:
+        print(f"[UI-REFRESH] ⚠️ UI refresh events failed (not critical): {refresh_error}")
+    
+    print(f"[CHANGE-DEBUG] ✅ Container-specific UI refresh applied")
+    print(f"[CHANGE-SUCCESS] 🎉 Variable '{variable_name}' ({type(variable).__name__}) changed to '{response_value}'")
+    print(f"[CHANGE-SUCCESS] 📱 Container-specific UI refresh applied")
 
 
 def _write_variable_response(py_db, request, value, success, message):
-    body = SetVariableResponseBody("")
-    variables_response = pydevd_base_schema.build_response(request, kwargs={"body": body, "success": False, "message": message})
-    cmd = NetCommand(CMD_RETURN, 0, variables_response, is_json=True)
-    py_db.writer.add_command(cmd)
+    """SetVariable 오류 응답 (개선된 버전)"""
+    print(f"[CHANGE-DEBUG] ❌ Writing error response:")
+    print(f"[CHANGE-DEBUG]   success: {success}")
+    print(f"[CHANGE-DEBUG]   message: '{message}'")
+    print(f"[CHANGE-DEBUG]   value: '{value}'")
+    
+    body = SetVariableResponseBody(value=value, type="<e>", variablesReference=0)
+    variables_response = pydevd_base_schema.build_response(
+        request, 
+        kwargs={
+            "body": body, 
+            "success": success, 
+            "message": message
+        }
+    )
+    py_db.writer.add_command(NetCommand(CMD_RETURN, 0, variables_response, is_json=True))
+    
+    # 오류도 사용자에게 알림
+    if not success:
+        error_output = {
+            "type": "event",
+            "event": "output",
+            "body": {
+                "category": "stderr", 
+                "output": f"❌ Variable change failed: {message}\n"
+            }
+        }
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, error_output, is_json=True))
+        print(f"[CHANGE-DEBUG] ❌ Error response sent to VS Code")
 
+
+def _create_presentation_hint_for_changed_variable(variable_name, var_type, scope):
+    """변경된 변수를 위한 presentationHint 생성"""
+    hint = {
+        "kind": "data",
+        "attributes": ["modified"]  # 수정됨을 명시
+    }
+    
+    # 변수 타입별 힌트
+    if var_type in ["list", "dict", "set", "tuple"]:
+        hint["attributes"].append("hasObjectId")
+    elif var_type in ["int", "float", "str", "bool"]:
+        hint["kind"] = "data"
+    elif var_type in ["function", "method"]:
+        hint["kind"] = "method"
+        hint["attributes"].append("readOnly")
+    
+    # Scope별 가시성
+    if scope and hasattr(scope, 'scope'):
+        if scope.scope == "locals":
+            hint["visibility"] = "public"
+        elif scope.scope == "globals":
+            hint["visibility"] = "internal"
+    else:
+        hint["visibility"] = "public"
+    
+    return hint
+
+
+def _apply_frame_variable_ui_refresh(py_db, variables_reference, variable_name, var_data):
+    """_FrameVariable 컨테이너의 UI 새로고침"""
+    print(f"[FRAME-REFRESH] Applying frame variable refresh for '{variable_name}'")
+    
+    # Frame 변수는 일반적으로 locals/globals scope
+    thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+    if thread_id:
+        # 특정 프레임의 변수 영역 무효화
+        invalidate_event = {
+            "type": "event",
+            "event": "invalidated", 
+            "body": {
+                "areas": ["variables"],
+                "threadId": thread_id,
+                "stackFrameId": variables_reference
+            }
+        }
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+        print(f"[FRAME-REFRESH] Frame invalidation event sent")
+
+
+def _apply_object_variable_ui_refresh(py_db, variables_reference, variable_name, var_data):
+    """_ObjectVariable 컨테이너의 UI 새로고침"""
+    print(f"[OBJECT-REFRESH] Applying object variable refresh for '{variable_name}'")
+    
+    # 객체 변수는 부모 컨테이너도 새로고침 필요할 수 있음
+    thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+    if thread_id:
+        # 현재 변수 참조 영역 무효화
+        invalidate_event = {
+            "type": "event",
+            "event": "invalidated",
+            "body": {
+                "areas": ["variables"],
+                "threadId": thread_id
+            }
+        }
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+        print(f"[OBJECT-REFRESH] Object invalidation event sent")
+
+
+def _apply_generic_variable_ui_refresh(py_db, variables_reference, variable_name, var_data):
+    """일반 변수 컨테이너의 UI 새로고침"""
+    print(f"[GENERIC-REFRESH] Applying generic variable refresh for '{variable_name}'")
+    
+    thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+    if thread_id:
+        invalidate_event = {
+            "type": "event",
+            "event": "invalidated",
+            "body": {
+                "areas": ["variables"],
+                "threadId": thread_id
+            }
+        }
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+        print(f"[GENERIC-REFRESH] Generic invalidation event sent")
+
+
+def _trigger_ui_refresh_events(py_db, variables_reference, variable_name, var_data):
+    """VS Code UI 새로고침을 위한 이벤트들 전송"""
+    try:
+        thread_id = py_db.suspended_frames_manager.get_thread_id_for_variable_reference(variables_reference)
+        if not thread_id:
+            print(f"[UI-REFRESH] ⚠️ No thread_id found for variables_reference {variables_reference}")
+            return
+        
+        # 🚀 방법 1: Variables 영역 무효화 (가장 효과적)
+        invalidate_event = {
+            "type": "event",
+            "event": "invalidated",
+            "body": {
+                "areas": ["variables"],  # Variables 창 새로고침
+                "threadId": thread_id,
+                "stackFrameId": variables_reference
+            }
+        }
+        
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, invalidate_event, is_json=True))
+        print(f"[UI-REFRESH] 🔄 Variables invalidation event sent for thread {thread_id}")
+        
+        # 🚀 방법 2: Output 이벤트로 사용자 알림
+        value_preview = str(var_data.get("value", ""))[:50]
+        if len(str(var_data.get("value", ""))) > 50:
+            value_preview += "..."
+            
+        output_event = {
+            "type": "event",
+            "event": "output",
+            "body": {
+                "category": "console",
+                "output": f"✅ {variable_name} = {value_preview}\n"
+            }
+        }
+        
+        py_db.writer.add_command(NetCommand(CMD_RETURN, 0, output_event, is_json=True))
+        print(f"[UI-REFRESH] 📢 Output notification sent: {variable_name} = {value_preview}")
+        
+    except Exception as refresh_error:
+        print(f"[UI-REFRESH] ❌ UI refresh events failed: {refresh_error}")
 
 @silence_warnings_decorator
 def internal_get_frame(dbg, seq, thread_id, frame_id):
@@ -1928,3 +4261,4 @@ class GetValueAsyncThreadConsole(AbstractGetValueAsyncThread):
     def send_result(self, xml):
         if self.frame_accessor is not None:
             self.frame_accessor.ReturnFullValue(self.seq, xml.getvalue())
+

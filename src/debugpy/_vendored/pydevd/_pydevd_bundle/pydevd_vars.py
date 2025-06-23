@@ -595,9 +595,9 @@ def evaluate_expression(py_db, frame, expression, is_exec):
         del initial_globals
         del frame
 
-
 def change_attr_expression(frame, attr, expression, dbg, value=SENTINEL_VALUE, /, scope: Optional[ScopeRequest]=None):
     """Changes some attribute in a given frame."""
+
     if frame is None:
         return
 
@@ -619,6 +619,7 @@ def change_attr_expression(frame, attr, expression, dbg, value=SENTINEL_VALUE, /
                 if value is SENTINEL_VALUE:
                     value = eval(expression, frame.f_globals, frame.f_locals)
                 frame.f_globals[attr] = value
+
                 return frame.f_globals[attr]
             else:
                 raise VariableError("Attribute %s not found in globals" % attr)
@@ -629,6 +630,7 @@ def change_attr_expression(frame, attr, expression, dbg, value=SENTINEL_VALUE, /
                         value = eval(expression, frame.f_globals, frame.f_locals)
                     frame.f_locals[attr] = value
                     pydevd_save_locals.save_locals(frame)
+
                     return frame.f_locals[attr]
 
             # i.e.: case with '.' or save locals not available (just exec the assignment in the frame).
@@ -640,8 +642,6 @@ def change_attr_expression(frame, attr, expression, dbg, value=SENTINEL_VALUE, /
 
     except Exception as e:
         pydev_log.exception(e)
-    
-
 
 MAXIMUM_ARRAY_SIZE = 100
 MAX_SLICE_SIZE = 1000

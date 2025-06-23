@@ -141,7 +141,8 @@ with open("DESCRIPTION.md", "r") as fh:
 
 if __name__ == "__main__":
     extras = {}
-    platforms = get_buildplatform()
+    # platforms = get_buildplatform()
+    platforms = ['linux', 'darwin']
     if platforms is not None:
         extras["platforms"] = platforms
 
@@ -211,5 +212,5 @@ if __name__ == "__main__":
                 "buggerking-adapter = buggerking.adapter.__main__:main",
             ],
         },
-        **extras
+        # **extras
     )
